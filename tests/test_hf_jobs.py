@@ -3,9 +3,13 @@ from __future__ import annotations
 import subprocess
 from typing import TYPE_CHECKING
 
+import pytest
+
 from upskill.hf_jobs import (
     JobsConfig,
     SubmittedJob,
+    _normalize_job_id,
+    _parse_submission_payload,
     build_submit_eval_job_command,
     parse_duration_seconds,
     submit_eval_job,
@@ -14,8 +18,6 @@ from upskill.hf_jobs import (
 
 if TYPE_CHECKING:
     from pathlib import Path
-
-    import pytest
 
 
 def test_parse_duration_seconds_supports_hf_style_suffixes() -> None:
@@ -79,11 +81,30 @@ def test_submit_eval_job_parses_json_output(
     assert submission.artifact_repo == "ns/repo"
 
 
+def test_parse_submission_payload_handles_preamble_lines() -> None:
+    payload = _parse_submission_payload(
+        "RUN_ID=abc123\n"
+        "Secrets to forward:\n"
+        "  - HF_TOKEN (present locally)\n"
+        '{"job_id":"job-123","run_id":"run-456","artifact_repo":"ns/repo"}\n'
+    )
+
+    assert payload["job_id"] == "job-123"
+
+
+def test_normalize_job_id_extracts_namespace_and_id_from_url() -> None:
+    assert (
+        _normalize_job_id("View at: https://huggingface.co/jobs/evalstate/69bd5e5f71691dc46f161e83")
+        == "evalstate/69bd5e5f71691dc46f161e83"
+    )
+
+
 def test_wait_for_job_outputs_downloads_full_directory(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     calls: list[list[str]] = []
+    messages: list[str] = []
 
     def fake_run(
         args: list[str],
@@ -108,7 +129,42 @@ def test_wait_for_job_outputs_downloads_full_directory(
         destination_root=tmp_path,
         wait_timeout_seconds=1.0,
         poll_interval_seconds=0.01,
+        progress_callback=messages.append,
     )
 
     assert output_dir == tmp_path / "outputs" / "run-456"
-    assert len(calls) == 2
+    assert len(calls) == 3
+    assert messages[0] == "waiting for job job-123 (run_id=run-456)"
+    assert "completed; downloading artifacts" in messages[1]
+
+
+def test_wait_for_job_outputs_raises_when_job_enters_error_stage(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    def fake_run(
+        args: list[str],
+        **kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        del kwargs
+        if args[:4] == ["hf", "jobs", "ps", "-a"]:
+            return subprocess.CompletedProcess(
+                args=args,
+                returncode=0,
+                stdout=(
+                    '[{"id":"job-123","owner":{"name":"evalstate"},'
+                    '"status":{"stage":"ERROR","message":"boom"}}]'
+                ),
+                stderr="",
+            )
+        return subprocess.CompletedProcess(args=args, returncode=1, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    with pytest.raises(RuntimeError, match="ended with stage ERROR"):
+        wait_for_job_outputs(
+            SubmittedJob(job_id="evalstate/job-123", run_id="run-456", artifact_repo="ns/repo"),
+            destination_root=tmp_path,
+            wait_timeout_seconds=1.0,
+            poll_interval_seconds=0.01,
+        )

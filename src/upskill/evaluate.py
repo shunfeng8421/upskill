@@ -1,29 +1,21 @@
-"""Skill evaluation - compare agent performance with and without skills using FastAgent."""
+"""Skill evaluation orchestration backed by an execution backend."""
 
 from __future__ import annotations
 
 import asyncio
-import importlib
+import json
 import logging
-import shutil
-import tempfile
-from contextlib import contextmanager, nullcontext, suppress
-from pathlib import Path
-from typing import TYPE_CHECKING, Any
-
-from fast_agent import ConversationSummary
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from collections.abc import Generator
+    from collections.abc import Callable
+    from pathlib import Path
 
-    from fast_agent.agents.llm_agent import LlmAgent
+    from upskill.executors.base import Executor
 
-from upskill.fastagent_integration import (
-    compose_instruction,
-)
-from upskill.logging import extract_stats_from_summary
+from upskill.artifacts import ensure_directory, sanitize_artifact_name
+from upskill.executors.contracts import ExecutionRequest
 from upskill.models import (
-    ConversationStats,
     EvalResults,
     ExpectedSpec,
     Skill,
@@ -33,55 +25,93 @@ from upskill.models import (
 )
 from upskill.validators import get_validator
 
-try:
-    rich_progress: Any | None = importlib.import_module("fast_agent.ui.rich_progress")
-except Exception:  # pragma: no cover - defensive import for older fast-agent versions
-    rich_progress = None
-
-progress_display: Any | None = getattr(rich_progress, "progress_display", None)
-
-
-def _hide_progress_task(task_name: str | None) -> None:
-    """Best-effort hide of a completed task from the shared progress display."""
-    if not task_name or progress_display is None:
-        return
-    hide_task = getattr(progress_display, "hide_task", None)
-    if not callable(hide_task):
-        return
-    try:
-        hide_task(task_name)
-    except Exception:
-        # Progress cleanup is best-effort and should never fail evaluations.
-        return
-
-
 logger = logging.getLogger(__name__)
 
-PROMPT = (
-    "You are an evaluator of skills. You are given a skill and a test case. "
-    "You need to evaluate the skill on the test case and return a score."
-)
+
+def _write_test_result_summary(path: Path, result: TestResult) -> None:
+    """Persist a per-test result summary alongside raw artifacts."""
+    path.write_text(
+        json.dumps(result.model_dump(mode="json"), indent=2),
+        encoding="utf-8",
+    )
 
 
-@contextmanager
-def isolated_workspace(base_dir: Path | None = None, cleanup: bool = True) -> Generator[Path]:
-    """Create an isolated workspace for a test run.
-
-    Args:
-        base_dir: Optional parent directory for the workspace
-        cleanup: Whether to clean up the workspace after (default True)
-
-    Yields:
-        Path to the temporary workspace directory
-    """
-    workspace = tempfile.mkdtemp(dir=base_dir, prefix="upskill_run_")
-    workspace_path = Path(workspace)
+def _load_test_result_summary(path: Path) -> TestResult | None:
+    """Load a persisted per-test result summary."""
+    if not path.exists():
+        return None
     try:
-        yield workspace_path
-    finally:
-        if cleanup:
-            with suppress(Exception):
-                shutil.rmtree(workspace_path, ignore_errors=True)
+        return TestResult.model_validate_json(path.read_text(encoding="utf-8"))
+    except ValueError:
+        return None
+
+
+def apply_eval_metrics(results: EvalResults, test_cases: list[TestCase]) -> EvalResults:
+    """Populate aggregate metrics on an ``EvalResults`` instance."""
+    successes = sum(1 for r in results.with_skill_results if r.success)
+    results.with_skill_success_rate = successes / len(test_cases) if test_cases else 0
+    results.with_skill_total_tokens = sum(r.stats.total_tokens for r in results.with_skill_results)
+    results.with_skill_avg_turns = (
+        sum(r.stats.turns for r in results.with_skill_results) / len(test_cases)
+        if test_cases
+        else 0
+    )
+
+    if results.baseline_results:
+        successes = sum(1 for r in results.baseline_results if r.success)
+        results.baseline_success_rate = successes / len(test_cases) if test_cases else 0
+        results.baseline_total_tokens = sum(r.stats.total_tokens for r in results.baseline_results)
+        results.baseline_avg_turns = (
+            sum(r.stats.turns for r in results.baseline_results) / len(test_cases)
+            if test_cases
+            else 0
+        )
+
+    return results
+
+
+def load_eval_results_from_artifact_root(
+    *,
+    skill_name: str,
+    model: str,
+    artifact_root: Path,
+) -> EvalResults | None:
+    """Reconstruct eval results from persisted per-test summaries."""
+    if not artifact_root.exists():
+        return None
+
+    with_skill_results = [
+        loaded
+        for loaded in (
+            _load_test_result_summary(summary_path)
+            for summary_path in sorted(
+                (artifact_root / "with-skill").glob("test_*/test_result.json")
+            )
+        )
+        if loaded is not None
+    ]
+    baseline_results = [
+        loaded
+        for loaded in (
+            _load_test_result_summary(summary_path)
+            for summary_path in sorted((artifact_root / "baseline").glob("test_*/test_result.json"))
+        )
+        if loaded is not None
+    ]
+
+    if not with_skill_results and not baseline_results:
+        return None
+
+    reconstructed = EvalResults(
+        skill_name=skill_name,
+        model=model,
+        with_skill_results=with_skill_results,
+        baseline_results=baseline_results,
+    )
+    test_cases = [result.test_case for result in with_skill_results]
+    if not test_cases:
+        test_cases = [result.test_case for result in baseline_results]
+    return apply_eval_metrics(reconstructed, test_cases)
 
 
 def check_expected(
@@ -121,208 +151,204 @@ def check_expected(
     return True, None
 
 
-async def _run_test_with_evaluator(
-    test_case: TestCase,
-    evaluator: LlmAgent,
-    instruction: str | None,
-    *,
-    use_workspace: bool | None = None,
-    instance_name: str | None = None,
-) -> TestResult:
-    """Run a single test case using a provided evaluator agent."""
-    user_content = test_case.input
+def format_test_prompt(test_case: TestCase) -> str:
+    """Build the evaluator prompt, preserving legacy inline file context."""
+    prompt = test_case.input
     if test_case.context and test_case.context.files:
         for filename, content in test_case.context.files.items():
-            user_content += f"\n\n```{filename}\n{content}\n```"
+            prompt += f"\n\n```{filename}\n{content}\n```"
+    return prompt
 
-    # Determine if we need workspace isolation
-    needs_workspace = use_workspace if use_workspace is not None else bool(test_case.validator)
 
-    async def _run_in_workspace(workspace: Path | None) -> TestResult:
-        clone: LlmAgent | None = None
-        try:
-            clone = await evaluator.spawn_detached_instance(name=instance_name)
-            if workspace is not None:
-                enable_shell = getattr(clone, "enable_shell", None)
-                shell_enabled = getattr(clone, "shell_runtime_enabled", False)
-                if shell_enabled and callable(enable_shell):
-                    enable_shell(working_directory=workspace)
+async def _run_test_with_evaluator(
+    test_case: TestCase,
+    executor: Executor,
+    *,
+    skill: Skill | None,
+    model: str,
+    fastagent_config_path: Path,
+    cards_source_dir: Path,
+    artifact_dir: Path,
+    agent_name: str = "evaluator",
+    instance_name: str | None = None,
+) -> TestResult:
+    """Run a single test case through the configured executor."""
+    workspace_files = (
+        dict(test_case.context.files) if test_case.context and test_case.context.files else {}
+    )
+    normalized_artifact_dir = artifact_dir.resolve()
+    request = ExecutionRequest(
+        prompt=format_test_prompt(test_case),
+        model=model,
+        agent=agent_name,
+        fastagent_config_path=fastagent_config_path.resolve(),
+        artifact_dir=normalized_artifact_dir,
+        cards_source_dir=cards_source_dir.resolve(),
+        label=instance_name or (skill.name if skill else "baseline"),
+        skill=skill,
+        workspace_files=workspace_files,
+        enable_shell=bool(workspace_files or test_case.validator or test_case.output_file),
+        metadata={
+            "instance_name": instance_name,
+            "skill_name": skill.name if skill else None,
+            "has_validator": bool(test_case.validator),
+        },
+    )
 
-            if instruction is None:
-                clone.set_instruction("")
-            else:
-                clone.set_instruction(instruction)
-            output = await clone.send(user_content)
-            stats = ConversationStats()
+    try:
+        handle = await executor.execute(request)
+        execution_result = await executor.collect(handle)
+    except Exception as exc:
+        logger.exception("Evaluation execution failed", exc_info=exc)
+        result = TestResult(test_case=test_case, success=False, error=str(exc))
+        _write_test_result_summary(normalized_artifact_dir / "test_result.json", result)
+        return result
 
-            # Extract stats from agent history
-            try:
-                history = clone.message_history
-                summary = ConversationSummary(messages=history)
-                stats = extract_stats_from_summary(summary)
-            except Exception as exc:
-                logger.exception("Failed to extract stats from evaluator history", exc_info=exc)
+    if execution_result.error is not None:
+        result = TestResult(
+            test_case=test_case,
+            success=False,
+            output=execution_result.output_text,
+            tokens_used=execution_result.stats.total_tokens,
+            turns=execution_result.stats.turns,
+            error=execution_result.error,
+            stats=execution_result.stats,
+        )
+        _write_test_result_summary(normalized_artifact_dir / "test_result.json", result)
+        return result
 
-            # Check expected with custom validator support
-            if workspace and test_case.validator:
-                success, validation_result = check_expected(
-                    output or "",
-                    test_case.expected,
-                    workspace,
-                    test_case,
-                )
-            else:
-                success, validation_result = check_expected(
-                    output or "",
-                    test_case.expected,
-                    None,
-                    test_case,
-                )
-
-            return TestResult(
-                test_case=test_case,
-                success=success,
-                output=output,
-                tokens_used=stats.total_tokens,
-                turns=stats.turns,
-                stats=stats,
-                validation_result=validation_result,
-            )
-        except Exception as exc:
-            return TestResult(test_case=test_case, success=False, error=str(exc))
-        finally:
-            if clone is not None:
-                try:
-                    await clone.shutdown()
-                except Exception as exc:
-                    logger.exception("Failed to shutdown evaluator clone", exc_info=exc)
-            _hide_progress_task(instance_name)
-
-    if needs_workspace:
-        with isolated_workspace() as workspace:
-            return await _run_in_workspace(workspace)
-    return await _run_in_workspace(None)
+    success, validation_result = check_expected(
+        execution_result.output_text or "",
+        test_case.expected,
+        execution_result.workspace_dir,
+        test_case,
+    )
+    result = TestResult(
+        test_case=test_case,
+        success=success,
+        output=execution_result.output_text,
+        tokens_used=execution_result.stats.total_tokens,
+        turns=execution_result.stats.turns,
+        stats=execution_result.stats,
+        validation_result=validation_result,
+    )
+    _write_test_result_summary(normalized_artifact_dir / "test_result.json", result)
+    return result
 
 
 async def run_test(
     test_case: TestCase,
-    evaluator: LlmAgent,
+    executor: Executor,
     skill: Skill | None,
-    use_workspace: bool | None = None,
-    model: str | None = None,
+    *,
+    model: str,
+    fastagent_config_path: Path,
+    cards_source_dir: Path,
+    artifact_dir: Path,
     instance_name: str | None = None,
 ) -> TestResult:
-    """Run a single test case using an evaluator agent.
+    """Run a single test case via the execution backend.
 
     Args:
         test_case: The test case to run
-        evaluator: Evaluator agent to run the test case
+        executor: Execution backend to use
         skill: Optional skill to inject (None for baseline)
-        use_workspace: Force workspace isolation (auto-detected from test_case.validator)
         model: Model to evaluate with for this test case
+        fastagent_config_path: Fast-agent config to pass through to execution
+        cards_source_dir: Source directory for bundled agent cards
+        artifact_dir: Output directory for raw execution artifacts
         instance_name: Optional evaluator instance display name
     """
-
-    try:
-        if model is not None:
-            await evaluator.set_model(model)
-        instruction = compose_instruction(evaluator.instruction, skill) if skill else None
-        return await _run_test_with_evaluator(
-            test_case,
-            evaluator,
-            instruction,
-            use_workspace=use_workspace,
-            instance_name=instance_name,
-        )
-    except Exception as exc:
-        return TestResult(test_case=test_case, success=False, error=str(exc))
+    return await _run_test_with_evaluator(
+        test_case,
+        executor,
+        skill=skill,
+        model=model,
+        fastagent_config_path=fastagent_config_path,
+        cards_source_dir=cards_source_dir,
+        artifact_dir=artifact_dir,
+        instance_name=instance_name,
+    )
 
 
 async def evaluate_skill(
     skill: Skill,
     test_cases: list[TestCase],
-    evaluator: LlmAgent,
-    model: str | None = None,
+    executor: Executor,
+    *,
+    model: str,
+    fastagent_config_path: Path,
+    cards_source_dir: Path,
+    artifact_root: Path,
     run_baseline: bool = True,
     show_baseline_progress: bool = False,
+    max_parallel: int = 5,
+    progress_callback: Callable[[str], None] | None = None,
 ) -> EvalResults:
     """Evaluate a skill against test cases using FastAgent.
 
     Args:
         skill: The skill to evaluate
         test_cases: Test cases to run
-        evaluator: Evaluator agent to run the test cases
-        model: Model to evaluate on (defaults to config.eval_model)
+        executor: Execution backend to use
+        model: Model to evaluate on
+        fastagent_config_path: Fast-agent config path to propagate
+        cards_source_dir: Source directory for evaluator cards
+        artifact_root: Artifact root for preserved raw execution outputs
         run_baseline: Whether to also run without the skill
         show_baseline_progress: Whether to render baseline progress output
+        max_parallel: Maximum number of concurrent test executions
+        progress_callback: Optional callback for lightweight progress updates
 
     Returns:
         EvalResults comparing skill vs baseline
     """
-    resolved_model = model
-    if resolved_model is None:
-        evaluator_model = getattr(evaluator, "model", None)
-        resolved_model = evaluator_model if isinstance(evaluator_model, str) else "unknown"
+    del show_baseline_progress
 
-    results = EvalResults(skill_name=skill.name, model=resolved_model)
-
-    base_instruction = evaluator.instruction
+    results = EvalResults(skill_name=skill.name, model=model)
+    semaphore = asyncio.Semaphore(max_parallel)
+    ensure_directory(artifact_root)
 
     async def _run_batch(
-        instruction: str | None,
+        batch_skill: Skill | None,
         label: str,
     ) -> list[TestResult]:
-        tasks = []
-        for index, tc in enumerate(test_cases, start=1):
+        batch_root = ensure_directory(artifact_root / sanitize_artifact_name(label))
+
+        async def _run_single(index: int, test_case: TestCase) -> TestResult:
             instance_name = f"eval ({label} test {index})"
-            tasks.append(
-                _run_test_with_evaluator(
-                    tc,
-                    evaluator,
-                    instruction,
+            test_artifact_dir = batch_root / f"test_{index}"
+            if progress_callback is not None:
+                progress_callback(f"starting {label} test {index}/{len(test_cases)}")
+            async with semaphore:
+                result = await run_test(
+                    test_case,
+                    executor,
+                    batch_skill,
+                    model=model,
+                    fastagent_config_path=fastagent_config_path,
+                    cards_source_dir=cards_source_dir,
+                    artifact_dir=test_artifact_dir,
                     instance_name=instance_name,
                 )
-            )
+            if progress_callback is not None:
+                status = "ok" if result.success else "failed"
+                progress_callback(f"finished {label} test {index}/{len(test_cases)} ({status})")
+            return result
+
+        tasks = [
+            asyncio.create_task(_run_single(index, test_case))
+            for index, test_case in enumerate(test_cases, start=1)
+        ]
         return await asyncio.gather(*tasks)
 
-    if model is not None:
-        await evaluator.set_model(model)
-
     # Run with skill
-    skill_instruction = compose_instruction(base_instruction, skill)
-    results.with_skill_results = await _run_batch(skill_instruction, "with-skill")
-
-    # Calculate with-skill metrics
-    successes = sum(1 for r in results.with_skill_results if r.success)
-    results.with_skill_success_rate = successes / len(test_cases) if test_cases else 0
-    results.with_skill_total_tokens = sum(r.stats.total_tokens for r in results.with_skill_results)
-    results.with_skill_avg_turns = (
-        sum(r.stats.turns for r in results.with_skill_results) / len(test_cases)
-        if test_cases
-        else 0
-    )
+    results.with_skill_results = await _run_batch(skill, "with-skill")
 
     # Run baseline if requested
     if run_baseline:
-        pause_cm = nullcontext()
-        if not show_baseline_progress and progress_display is not None:
-            paused = getattr(progress_display, "paused", None)
-            if callable(paused):
-                pause_cm = paused()
-
-        with pause_cm:
-            results.baseline_results = await _run_batch(None, "baseline")
-
-        successes = sum(1 for r in results.baseline_results if r.success)
-        results.baseline_success_rate = successes / len(test_cases) if test_cases else 0
-        results.baseline_total_tokens = sum(r.stats.total_tokens for r in results.baseline_results)
-        results.baseline_avg_turns = (
-            sum(r.stats.turns for r in results.baseline_results) / len(test_cases)
-            if test_cases
-            else 0
-        )
-
-    return results
+        results.baseline_results = await _run_batch(None, "baseline")
+    return apply_eval_metrics(results, test_cases)
 
 
 def get_failure_descriptions(results: EvalResults) -> list[str]:

@@ -1,0 +1,80 @@
+"""Helpers for evaluation artifact materialization."""
+
+from __future__ import annotations
+
+import json
+import re
+import shutil
+from dataclasses import asdict
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+    from upskill.executors.contracts import ExecutionRequest
+
+_NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
+
+
+def sanitize_artifact_name(value: str) -> str:
+    """Convert a human-facing label into a filesystem-friendly name."""
+    normalized = _NON_ALNUM_RE.sub("-", value.strip().lower()).strip("-")
+    return normalized or "execution"
+
+
+def ensure_directory(path: Path) -> Path:
+    """Create a directory and return it."""
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def materialize_workspace(workspace_dir: Path, workspace_files: dict[str, str]) -> None:
+    """Write test workspace files into a preserved workspace directory."""
+    ensure_directory(workspace_dir)
+    for relative_path, content in workspace_files.items():
+        file_path = workspace_dir / relative_path
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_path.write_text(content, encoding="utf-8")
+
+
+def bundle_cards(
+    source_dir: Path,
+    destination_dir: Path,
+) -> Path:
+    """Copy the agent card bundle into the artifact directory."""
+    if destination_dir.exists():
+        shutil.rmtree(destination_dir)
+    shutil.copytree(source_dir, destination_dir)
+    return destination_dir
+
+
+def materialize_skill_bundle(
+    destination_dir: Path,
+    request: ExecutionRequest,
+) -> Path:
+    """Create the explicit skills root for a run."""
+    ensure_directory(destination_dir)
+    if request.skill is not None:
+        request.skill.save(destination_dir / request.skill.name)
+    return destination_dir
+
+
+def write_request_file(path: Path, request: ExecutionRequest) -> None:
+    """Persist request metadata for debugging and provenance."""
+    payload = asdict(request)
+    if request.skill is not None:
+        payload["skill"] = request.skill.model_dump(mode="json")
+    path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+
+
+def copy_config_file(source: Path, destination: Path) -> Path:
+    """Preserve the fast-agent config used for a run."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if source.exists():
+        shutil.copy2(source, destination)
+    else:
+        destination.write_text(
+            f"# Config file was not present at execution time: {source}\n",
+            encoding="utf-8",
+        )
+    return destination

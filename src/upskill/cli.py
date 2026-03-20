@@ -21,7 +21,9 @@ from rich.tree import Tree
 
 from upskill.config import Config, resolve_upskill_config_path
 from upskill.evaluate import evaluate_skill, get_failure_descriptions
+from upskill.executors.local_fast_agent import LocalFastAgentExecutor
 from upskill.generate import generate_skill, generate_tests, improve_skill, refine_skill
+from upskill.hf_jobs import JobsConfig, run_remote_eval
 from upskill.logging import (
     aggregate_conversation_stats,
     create_batch_folder,
@@ -50,6 +52,8 @@ if TYPE_CHECKING:
     from fast_agent.agents.llm_agent import LlmAgent
     from fast_agent.interfaces import AgentProtocol
 
+    from upskill.executors.base import Executor
+
 load_dotenv()
 
 console = Console()
@@ -64,6 +68,7 @@ class FastAgentSession(Protocol):
 
 
 EvalPlotLabelField = Literal["model", "skill_name"]
+ExecutorName = Literal["local", "jobs"]
 
 
 @asynccontextmanager
@@ -125,6 +130,38 @@ def _require_path(value: Path | None, *, field: str, command: str) -> Path:
     return value
 
 
+def _build_executor(name: ExecutorName) -> Executor:
+    """Construct an evaluation executor from a user-facing executor name."""
+    if name == "local":
+        return LocalFastAgentExecutor()
+    raise click.ClickException("The jobs executor is not implemented yet.")
+
+
+def _require_jobs_config(
+    *,
+    executor_name: ExecutorName,
+    artifact_repo: str | None,
+    wait: bool,
+    jobs_timeout: str,
+    jobs_flavor: str,
+    jobs_secrets: str,
+    jobs_namespace: str | None,
+) -> JobsConfig | None:
+    """Build jobs config when the jobs executor is selected."""
+    if executor_name != "jobs":
+        return None
+    if not artifact_repo:
+        raise click.ClickException("--artifact-repo is required when using --executor jobs.")
+    return JobsConfig(
+        artifact_repo=artifact_repo,
+        wait=wait,
+        jobs_timeout=jobs_timeout,
+        jobs_flavor=jobs_flavor,
+        jobs_secrets=jobs_secrets,
+        jobs_namespace=jobs_namespace,
+    )
+
+
 def _print_model_plan(command: str, resolved: ResolvedModels, runs: int | None = None) -> None:
     """Print resolved model plan for command execution."""
     console.print("[dim]Resolved model plan:[/dim]")
@@ -159,6 +196,11 @@ def _render_bar(value: float, width: int = 20) -> str:
     filled = round(clamped * width)
     empty = width - filled
     return "█" * filled + "░" * empty
+
+
+def _print_eval_progress(message: str) -> None:
+    """Render a lightweight evaluation progress line."""
+    console.print(f"[dim]{message}[/dim]")
 
 
 class EvalPlotResult(TypedDict):
@@ -283,6 +325,24 @@ def main():
 @click.option("-o", "--output", type=click.Path(), help="Output directory for skill")
 @click.option("--no-eval", is_flag=True, help="Skip eval and refinement")
 @click.option("--eval-model", help="Optional extra cross-model eval pass after generation")
+@click.option(
+    "--executor",
+    type=click.Choice(["local", "jobs"]),
+    default="local",
+    show_default=True,
+    help="Execution backend for evaluation/refinement runs",
+)
+@click.option("--artifact-repo", help="Dataset repo for remote job artifacts")
+@click.option("--wait/--no-wait", default=False, help="Wait for remote jobs and download results")
+@click.option("--jobs-timeout", default="2h", show_default=True, help="HF Jobs timeout")
+@click.option("--jobs-flavor", default="cpu-basic", show_default=True, help="HF Jobs flavor")
+@click.option(
+    "--jobs-secrets",
+    default="HF_TOKEN",
+    show_default=True,
+    help="Comma-separated HF Job secrets to forward",
+)
+@click.option("--jobs-namespace", help="Optional Hugging Face Jobs namespace")
 @click.option("--runs-dir", type=click.Path(), help="Directory for run logs (default: ./runs)")
 @click.option("--log-runs/--no-log-runs", default=True, help="Log run data (default: enabled)")
 def generate(
@@ -295,6 +355,13 @@ def generate(
     output: str | None,
     no_eval: bool,
     eval_model: str | None,
+    executor: ExecutorName,
+    artifact_repo: str | None,
+    wait: bool,
+    jobs_timeout: str,
+    jobs_flavor: str,
+    jobs_secrets: str,
+    jobs_namespace: str | None,
     runs_dir: str | None,
     log_runs: bool,
 ):
@@ -351,6 +418,13 @@ def generate(
             output,
             no_eval,
             eval_model,
+            executor,
+            artifact_repo,
+            wait,
+            jobs_timeout,
+            jobs_flavor,
+            jobs_secrets,
+            jobs_namespace,
             runs_dir,
             log_runs,
         )
@@ -367,11 +441,27 @@ async def _generate_async(  # noqa: C901
     output: str | None,
     no_eval: bool,
     eval_model: str | None,
+    executor_name: ExecutorName,
+    artifact_repo: str | None,
+    wait: bool,
+    jobs_timeout: str,
+    jobs_flavor: str,
+    jobs_secrets: str,
+    jobs_namespace: str | None,
     runs_dir: str | None,
     log_runs: bool,
 ):
     """Async implementation of generate command."""
     config = Config.load()
+    jobs_config = _require_jobs_config(
+        executor_name=executor_name,
+        artifact_repo=artifact_repo,
+        wait=wait,
+        jobs_timeout=jobs_timeout,
+        jobs_flavor=jobs_flavor,
+        jobs_secrets=jobs_secrets,
+        jobs_namespace=jobs_namespace,
+    )
     resolved = resolve_models(
         "generate",
         config=config,
@@ -393,274 +483,384 @@ async def _generate_async(  # noqa: C901
 
     _print_model_plan("generate", resolved)
 
-    # Setup run logging if enabled
-    batch_id = None
-    batch_folder = None
+    # Setup artifact storage and optional run logging
+    runs_path = Path(runs_dir) if runs_dir else config.runs_dir
+    batch_id, batch_folder = create_batch_folder(runs_path)
     run_results: list[RunResult] = []
-
+    console.print(f"Artifacts saved to: {batch_folder}", style="dim")
     if log_runs:
-        runs_path = Path(runs_dir) if runs_dir else config.runs_dir
-        batch_id, batch_folder = create_batch_folder(runs_path)
         console.print(f"Logging runs to: {batch_folder}", style="dim")
 
     async with _fast_agent_context(config) as agent:
-        # Generate from trace file
-        if from_trace:
-            console.print(f"Generating skill from trace: {from_trace}", style="dim")
-            trace_path = Path(from_trace)
-            with open(trace_path, encoding="utf-8") as f:
-                trace_content = f.read()
+        cards = resources.files("upskill").joinpath("agent_cards")
+        with resources.as_file(cards) as cards_path:
+            # Generate from trace file
+            if from_trace:
+                console.print(f"Generating skill from trace: {from_trace}", style="dim")
+                trace_path = Path(from_trace)
+                with open(trace_path, encoding="utf-8") as f:
+                    trace_content = f.read()
 
-            # Try to parse as JSON, otherwise use as plain text
-            if trace_path.suffix.lower() == ".json":
-                try:
-                    trace_data = json.loads(trace_content)
-                    trace_context = json.dumps(trace_data, indent=2)[:4000]
-                except json.JSONDecodeError:
+                # Try to parse as JSON, otherwise use as plain text
+                if trace_path.suffix.lower() == ".json":
+                    try:
+                        trace_data = json.loads(trace_content)
+                        trace_context = json.dumps(trace_data, indent=2)[:4000]
+                    except json.JSONDecodeError:
+                        trace_context = trace_content[:4000]
+                else:
+                    # Plain text, markdown, etc.
                     trace_context = trace_content[:4000]
-            else:
-                # Plain text, markdown, etc.
-                trace_context = trace_content[:4000]
 
-            task = f"{task}\n\nBased on this agent trace:\n\n{trace_context}"
-            console.print(f"Generating skill with {skill_gen_model}...", style="dim")
-            await _set_agent_model(agent.skill_gen, skill_gen_model)
-            skill = await generate_skill(
-                task=task,
-                examples=examples,
-                generator=agent.skill_gen,
-                model=skill_gen_model,
-            )
-        # Improve existing skill
-        elif from_skill:
-            existing_skill = Skill.load(Path(from_skill))
-            console.print(
-                f"Improving [bold]{existing_skill.name}[/bold] with {skill_gen_model}...",
-                style="dim",
-            )
-            await _set_agent_model(agent.skill_gen, skill_gen_model)
-            skill = await improve_skill(
-                existing_skill,
-                instructions=task,
-                generator=agent.skill_gen,
-                model=skill_gen_model,
-            )
-        else:
-            console.print(f"Generating skill with {skill_gen_model}...", style="dim")
-            await _set_agent_model(agent.skill_gen, skill_gen_model)
-            skill = await generate_skill(
-                task=task,
-                examples=examples,
-                generator=agent.skill_gen,
-                model=skill_gen_model,
-            )
-        if no_eval:
-            _save_and_display(skill, output, config)
-            return
-
-        console.print("Generating test cases...", style="dim")
-        await _set_agent_model(agent.test_gen, test_gen_model)
-        test_cases = await generate_tests(task, generator=agent.test_gen, model=test_gen_model)
-
-        # Eval loop with refinement (on skill generation model)
-        prev_success_rate = 0.0
-        results = None
-        attempts = max(1, config.max_refine_attempts)
-        for attempt in range(attempts):
-            console.print(
-                f"Evaluating on {skill_gen_model}... (attempt {attempt + 1})",
-                style="dim",
-            )
-
-            # Create run folder for logging (2 folders per attempt: baseline + with_skill)
-            run_folder = None
-            if log_runs and batch_folder:
-                baseline_run_num = attempt * 2 + 1
-                run_folder = create_run_folder(batch_folder, baseline_run_num)
-                write_run_metadata(
-                    run_folder,
-                    RunMetadata(
-                        model=skill_gen_model,
-                        task=task,
-                        batch_id=batch_id or "",
-                        run_number=baseline_run_num,
-                    ),
-                )
-
-            console.print("[dim]Starting evaluation run...[/dim]")
-
-            results = await evaluate_skill(
-                skill,
-                test_cases=test_cases,
-                evaluator=agent.evaluator,
-                model=skill_gen_model,
-                show_baseline_progress=False,
-            )
-
-            # Log run results (both baseline and with-skill for plot command)
-            if log_runs and run_folder:
-                # Log baseline result
-                baseline_result = RunResult(
-                    metadata=RunMetadata(
-                        model=skill_gen_model,
-                        task=task,
-                        batch_id=batch_id or "",
-                        run_number=baseline_run_num,
-                    ),
-                    stats=aggregate_conversation_stats(results.baseline_results),
-                    passed=results.baseline_success_rate > 0.5,
-                    assertions_passed=int(results.baseline_success_rate * len(test_cases)),
-                    assertions_total=len(test_cases),
-                    run_type="baseline",
-                    skill_name=skill.name,
-                )
-                write_run_result(run_folder, baseline_result)
-                run_results.append(baseline_result)
-
-                # Log with-skill result (in a separate folder)
-                with_skill_folder = create_run_folder(
-                    _require_path(batch_folder, field="batch_folder", command="generate"),
-                    attempt * 2 + 2,
-                )
-                with_skill_result = RunResult(
-                    metadata=RunMetadata(
-                        model=skill_gen_model,
-                        task=task,
-                        batch_id=batch_id or "",
-                        run_number=attempt * 2 + 2,
-                    ),
-                    stats=aggregate_conversation_stats(results.with_skill_results),
-                    passed=results.is_beneficial,
-                    assertions_passed=int(results.with_skill_success_rate * len(test_cases)),
-                    assertions_total=len(test_cases),
-                    run_type="with_skill",
-                    skill_name=skill.name,
-                )
-                write_run_metadata(with_skill_folder, with_skill_result.metadata)
-                write_run_result(with_skill_folder, with_skill_result)
-                run_results.append(with_skill_result)
-
-            lift = results.skill_lift
-            lift_str = f"+{lift:.0%}" if lift > 0 else f"{lift:.0%}"
-
-            if results.is_beneficial:
-                console.print(
-                    f"  {results.baseline_success_rate:.0%} -> "
-                    f"{results.with_skill_success_rate:.0%} ({lift_str}) [green]OK[/green]"
-                )
-                break
-
-            console.print(
-                f"  {results.baseline_success_rate:.0%} -> "
-                f"{results.with_skill_success_rate:.0%} ({lift_str}) not good enough"
-            )
-
-            if abs(results.with_skill_success_rate - prev_success_rate) < 0.05:
-                console.print("  [yellow]Plateaued, stopping[/yellow]")
-                break
-
-            prev_success_rate = results.with_skill_success_rate
-
-            if attempt < attempts - 1:
-                console.print("Refining...", style="dim")
-                failures = get_failure_descriptions(results)
+                task = f"{task}\n\nBased on this agent trace:\n\n{trace_context}"
+                console.print(f"Generating skill with {skill_gen_model}...", style="dim")
                 await _set_agent_model(agent.skill_gen, skill_gen_model)
-                skill = await refine_skill(
-                    skill,
-                    failures,
+                skill = await generate_skill(
+                    task=task,
+                    examples=examples,
                     generator=agent.skill_gen,
                     model=skill_gen_model,
                 )
+            # Improve existing skill
+            elif from_skill:
+                existing_skill = Skill.load(Path(from_skill))
+                console.print(
+                    f"Improving [bold]{existing_skill.name}[/bold] with {skill_gen_model}...",
+                    style="dim",
+                )
+                await _set_agent_model(agent.skill_gen, skill_gen_model)
+                skill = await improve_skill(
+                    existing_skill,
+                    instructions=task,
+                    generator=agent.skill_gen,
+                    model=skill_gen_model,
+                )
+            else:
+                console.print(f"Generating skill with {skill_gen_model}...", style="dim")
+                await _set_agent_model(agent.skill_gen, skill_gen_model)
+                skill = await generate_skill(
+                    task=task,
+                    examples=examples,
+                    generator=agent.skill_gen,
+                    model=skill_gen_model,
+                )
+            if no_eval:
+                _save_and_display(skill, output, config, artifact_path=batch_folder)
+                return
 
-        # If eval_model specified, also eval on that model
-        eval_results = None
-        if extra_eval_model:
-            console.print(f"Evaluating on {extra_eval_model}...", style="dim")
+            console.print("Generating test cases...", style="dim")
+            await _set_agent_model(agent.test_gen, test_gen_model)
+            test_cases = await generate_tests(task, generator=agent.test_gen, model=test_gen_model)
 
-            # Create run folder for eval model
-            run_folder = None
-            if log_runs and batch_folder:
-                run_number = len(run_results) + 1
-                run_folder = create_run_folder(batch_folder, run_number)
-                write_run_metadata(
-                    run_folder,
-                    RunMetadata(
+            if executor_name == "jobs":
+                if jobs_config is None:
+                    raise RuntimeError("Jobs config was not initialized.")
+                if not wait:
+                    remote_results, job_refs = run_remote_eval(
+                        skill=skill,
+                        test_cases=test_cases,
+                        model=skill_gen_model,
+                        jobs_config=jobs_config,
+                        fastagent_config_path=config.effective_fastagent_config,
+                        destination_root=batch_folder / "remote_downloads" / "attempt_1",
+                        run_baseline=True,
+                        progress_callback=_print_eval_progress,
+                    )
+                    del remote_results
+                    console.print(
+                        "[yellow]Remote eval submitted without --wait; "
+                        "refinement is skipped for this run.[/yellow]"
+                    )
+                    console.print(f"Remote job id(s): {', '.join(job_refs)}")
+                    _save_and_display(skill, output, config, artifact_path=batch_folder)
+                    return
+
+                prev_success_rate = 0.0
+                results = None
+                attempts = max(1, config.max_refine_attempts)
+                for attempt in range(attempts):
+                    console.print(
+                        f"Evaluating on {skill_gen_model} via HF Jobs... (attempt {attempt + 1})",
+                        style="dim",
+                    )
+                    results, job_refs = run_remote_eval(
+                        skill=skill,
+                        test_cases=test_cases,
+                        model=skill_gen_model,
+                        jobs_config=jobs_config,
+                        destination_root=batch_folder
+                        / "remote_downloads"
+                        / f"attempt_{attempt + 1}",
+                        fastagent_config_path=config.effective_fastagent_config,
+                        run_baseline=True,
+                        progress_callback=_print_eval_progress,
+                    )
+                    console.print(f"Remote job id(s): {', '.join(job_refs)}")
+                    if results is None:
+                        break
+
+                    lift = results.skill_lift
+                    lift_str = f"+{lift:.0%}" if lift > 0 else f"{lift:.0%}"
+                    console.print(
+                        f"  {results.baseline_success_rate:.0%} -> "
+                        f"{results.with_skill_success_rate:.0%} ({lift_str})"
+                    )
+
+                    if results.is_beneficial:
+                        break
+
+                    if abs(results.with_skill_success_rate - prev_success_rate) < 0.05:
+                        console.print("  [yellow]Plateaued, stopping[/yellow]")
+                        break
+
+                    prev_success_rate = results.with_skill_success_rate
+
+                    if attempt < attempts - 1:
+                        console.print("Refining...", style="dim")
+                        failures = get_failure_descriptions(results)
+                        await _set_agent_model(agent.skill_gen, skill_gen_model)
+                        skill = await refine_skill(
+                            skill,
+                            failures,
+                            generator=agent.skill_gen,
+                            model=skill_gen_model,
+                        )
+
+                eval_results = None
+                if extra_eval_model:
+                    console.print(f"Evaluating on {extra_eval_model} via HF Jobs...", style="dim")
+                    eval_results, job_refs = run_remote_eval(
+                        skill=skill,
+                        test_cases=test_cases,
                         model=extra_eval_model,
-                        task=task,
-                        batch_id=batch_id or "",
-                        run_number=run_number,
-                    ),
+                        jobs_config=jobs_config,
+                        destination_root=batch_folder / "remote_downloads" / extra_eval_model,
+                        fastagent_config_path=config.effective_fastagent_config,
+                        run_baseline=True,
+                        progress_callback=_print_eval_progress,
+                    )
+                    console.print(f"Remote job id(s): {', '.join(job_refs)}")
+
+                if results:
+                    skill.metadata.test_pass_rate = results.with_skill_success_rate
+
+                _save_and_display(
+                    skill,
+                    output,
+                    config,
+                    results,
+                    eval_results,
+                    skill_gen_model,
+                    extra_eval_model,
+                    batch_folder,
+                )
+                return
+
+            executor = _build_executor("local")
+
+            # Eval loop with refinement (on skill generation model)
+            prev_success_rate = 0.0
+            results = None
+            attempts = max(1, config.max_refine_attempts)
+            for attempt in range(attempts):
+                console.print(
+                    f"Evaluating on {skill_gen_model}... (attempt {attempt + 1})",
+                    style="dim",
                 )
 
-            eval_results = await evaluate_skill(
-                skill,
-                test_cases,
-                evaluator=agent.evaluator,
-                model=extra_eval_model,
-                show_baseline_progress=False,
-            )
+                # Create run folder for logging (2 folders per attempt: baseline + with_skill)
+                run_folder = None
+                if log_runs:
+                    baseline_run_num = attempt * 2 + 1
+                    run_folder = create_run_folder(batch_folder, baseline_run_num)
+                    write_run_metadata(
+                        run_folder,
+                        RunMetadata(
+                            model=skill_gen_model,
+                            task=task,
+                            batch_id=batch_id,
+                            run_number=baseline_run_num,
+                        ),
+                    )
 
-            # Log eval run results (both baseline and with-skill)
-            if log_runs and run_folder:
-                # Log baseline result
-                baseline_result = RunResult(
-                    metadata=RunMetadata(
-                        model=extra_eval_model,
-                        task=task,
-                        batch_id=batch_id or "",
-                        run_number=run_number,
-                    ),
-                    stats=aggregate_conversation_stats(eval_results.baseline_results),
-                    passed=eval_results.baseline_success_rate > 0.5,
-                    assertions_passed=int(eval_results.baseline_success_rate * len(test_cases)),
-                    assertions_total=len(test_cases),
-                    run_type="baseline",
-                    skill_name=skill.name,
+                console.print("[dim]Starting evaluation run...[/dim]")
+
+                results = await evaluate_skill(
+                    skill,
+                    test_cases=test_cases,
+                    executor=executor,
+                    model=skill_gen_model,
+                    fastagent_config_path=config.effective_fastagent_config,
+                    cards_source_dir=cards_path,
+                    artifact_root=batch_folder / f"attempt_{attempt + 1}",
+                    show_baseline_progress=False,
+                    progress_callback=_print_eval_progress,
                 )
-                write_run_result(run_folder, baseline_result)
-                run_results.append(baseline_result)
 
-                # Log with-skill result
-                with_skill_folder = create_run_folder(
-                    _require_path(batch_folder, field="batch_folder", command="generate"),
-                    run_number + 1,
+                # Log run results (both baseline and with-skill for plot command)
+                if log_runs and run_folder:
+                    # Log baseline result
+                    baseline_result = RunResult(
+                        metadata=RunMetadata(
+                            model=skill_gen_model,
+                            task=task,
+                            batch_id=batch_id,
+                            run_number=baseline_run_num,
+                        ),
+                        stats=aggregate_conversation_stats(results.baseline_results),
+                        passed=results.baseline_success_rate > 0.5,
+                        assertions_passed=int(results.baseline_success_rate * len(test_cases)),
+                        assertions_total=len(test_cases),
+                        run_type="baseline",
+                        skill_name=skill.name,
+                    )
+                    write_run_result(run_folder, baseline_result)
+                    run_results.append(baseline_result)
+
+                    # Log with-skill result (in a separate folder)
+                    with_skill_folder = create_run_folder(batch_folder, attempt * 2 + 2)
+                    with_skill_result = RunResult(
+                        metadata=RunMetadata(
+                            model=skill_gen_model,
+                            task=task,
+                            batch_id=batch_id,
+                            run_number=attempt * 2 + 2,
+                        ),
+                        stats=aggregate_conversation_stats(results.with_skill_results),
+                        passed=results.is_beneficial,
+                        assertions_passed=int(results.with_skill_success_rate * len(test_cases)),
+                        assertions_total=len(test_cases),
+                        run_type="with_skill",
+                        skill_name=skill.name,
+                    )
+                    write_run_metadata(with_skill_folder, with_skill_result.metadata)
+                    write_run_result(with_skill_folder, with_skill_result)
+                    run_results.append(with_skill_result)
+
+                lift = results.skill_lift
+                lift_str = f"+{lift:.0%}" if lift > 0 else f"{lift:.0%}"
+
+                if results.is_beneficial:
+                    console.print(
+                        f"  {results.baseline_success_rate:.0%} -> "
+                        f"{results.with_skill_success_rate:.0%} ({lift_str}) [green]OK[/green]"
+                    )
+                    break
+
+                console.print(
+                    f"  {results.baseline_success_rate:.0%} -> "
+                    f"{results.with_skill_success_rate:.0%} ({lift_str}) not good enough"
                 )
-                with_skill_result = RunResult(
-                    metadata=RunMetadata(
-                        model=extra_eval_model,
-                        task=task,
-                        batch_id=batch_id or "",
-                        run_number=run_number + 1,
-                    ),
-                    stats=aggregate_conversation_stats(eval_results.with_skill_results),
-                    passed=eval_results.is_beneficial,
-                    assertions_passed=int(eval_results.with_skill_success_rate * len(test_cases)),
-                    assertions_total=len(test_cases),
-                    run_type="with_skill",
-                    skill_name=skill.name,
+
+                if abs(results.with_skill_success_rate - prev_success_rate) < 0.05:
+                    console.print("  [yellow]Plateaued, stopping[/yellow]")
+                    break
+
+                prev_success_rate = results.with_skill_success_rate
+
+                if attempt < attempts - 1:
+                    console.print("Refining...", style="dim")
+                    failures = get_failure_descriptions(results)
+                    await _set_agent_model(agent.skill_gen, skill_gen_model)
+                    skill = await refine_skill(
+                        skill,
+                        failures,
+                        generator=agent.skill_gen,
+                        model=skill_gen_model,
+                    )
+
+            # If eval_model specified, also eval on that model
+            eval_results = None
+            if extra_eval_model:
+                console.print(f"Evaluating on {extra_eval_model}...", style="dim")
+
+                # Create run folder for eval model
+                run_folder = None
+                if log_runs:
+                    run_number = len(run_results) + 1
+                    run_folder = create_run_folder(batch_folder, run_number)
+                    write_run_metadata(
+                        run_folder,
+                        RunMetadata(
+                            model=extra_eval_model,
+                            task=task,
+                            batch_id=batch_id,
+                            run_number=run_number,
+                        ),
+                    )
+
+                eval_results = await evaluate_skill(
+                    skill,
+                    test_cases,
+                    executor=executor,
+                    model=extra_eval_model,
+                    fastagent_config_path=config.effective_fastagent_config,
+                    cards_source_dir=cards_path,
+                    artifact_root=batch_folder / f"eval_{extra_eval_model}",
+                    show_baseline_progress=False,
+                    progress_callback=_print_eval_progress,
                 )
-                write_run_metadata(with_skill_folder, with_skill_result.metadata)
-                write_run_result(with_skill_folder, with_skill_result)
-                run_results.append(with_skill_result)
 
-            lift = eval_results.skill_lift
-            lift_str = f"+{lift:.0%}" if lift > 0 else f"{lift:.0%}"
-            console.print(
-                f"  {eval_results.baseline_success_rate:.0%} -> "
-                f"{eval_results.with_skill_success_rate:.0%} ({lift_str})"
-            )
+                # Log eval run results (both baseline and with-skill)
+                if log_runs and run_folder:
+                    # Log baseline result
+                    baseline_result = RunResult(
+                        metadata=RunMetadata(
+                            model=extra_eval_model,
+                            task=task,
+                            batch_id=batch_id,
+                            run_number=run_number,
+                        ),
+                        stats=aggregate_conversation_stats(eval_results.baseline_results),
+                        passed=eval_results.baseline_success_rate > 0.5,
+                        assertions_passed=int(eval_results.baseline_success_rate * len(test_cases)),
+                        assertions_total=len(test_cases),
+                        run_type="baseline",
+                        skill_name=skill.name,
+                    )
+                    write_run_result(run_folder, baseline_result)
+                    run_results.append(baseline_result)
 
-        # Write batch summary
-        if log_runs and batch_folder and batch_id:
-            summary = BatchSummary(
-                batch_id=batch_id,
-                model=skill_gen_model,
-                task=task,
-                total_runs=len(run_results),
-                passed_runs=sum(1 for r in run_results if r.passed),
-                results=run_results,
-            )
-            write_batch_summary(batch_folder, summary)
+                    # Log with-skill result
+                    with_skill_folder = create_run_folder(batch_folder, run_number + 1)
+                    with_skill_result = RunResult(
+                        metadata=RunMetadata(
+                            model=extra_eval_model,
+                            task=task,
+                            batch_id=batch_id,
+                            run_number=run_number + 1,
+                        ),
+                        stats=aggregate_conversation_stats(eval_results.with_skill_results),
+                        passed=eval_results.is_beneficial,
+                        assertions_passed=int(
+                            eval_results.with_skill_success_rate * len(test_cases)
+                        ),
+                        assertions_total=len(test_cases),
+                        run_type="with_skill",
+                        skill_name=skill.name,
+                    )
+                    write_run_metadata(with_skill_folder, with_skill_result.metadata)
+                    write_run_result(with_skill_folder, with_skill_result)
+                    run_results.append(with_skill_result)
+
+                lift = eval_results.skill_lift
+                lift_str = f"+{lift:.0%}" if lift > 0 else f"{lift:.0%}"
+                console.print(
+                    f"  {eval_results.baseline_success_rate:.0%} -> "
+                    f"{eval_results.with_skill_success_rate:.0%} ({lift_str})"
+                )
+
+            # Write batch summary
+            if log_runs:
+                summary = BatchSummary(
+                    batch_id=batch_id,
+                    model=skill_gen_model,
+                    task=task,
+                    total_runs=len(run_results),
+                    passed_runs=sum(1 for r in run_results if r.passed),
+                    results=run_results,
+                )
+                write_batch_summary(batch_folder, summary)
 
     if not no_eval and skill is not None:
         if results:
@@ -678,6 +878,7 @@ async def _generate_async(  # noqa: C901
             eval_results,
             skill_gen_model,
             extra_eval_model,
+            batch_folder,
         )
 
 
@@ -689,6 +890,7 @@ def _save_and_display(
     eval_results: EvalResults | None = None,
     skill_gen_model: str | None = None,
     eval_model: str | None = None,
+    artifact_path: Path | None = None,
 ):
     """Save skill and display summary."""
     output_path = Path(output) if output else config.skills_dir / skill.name
@@ -760,6 +962,8 @@ def _save_and_display(
 
     console.print()
     console.print(f"Saved to {output_path}")
+    if artifact_path is not None:
+        console.print(f"Artifacts saved to {artifact_path}")
 
 
 @main.command("eval")
@@ -783,6 +987,24 @@ def _save_and_display(
     help="Skip baseline comparison in simple eval mode (ignored in benchmark mode)",
 )
 @click.option("-v", "--verbose", is_flag=True, help="Show per-test results")
+@click.option(
+    "--executor",
+    type=click.Choice(["local", "jobs"]),
+    default="local",
+    show_default=True,
+    help="Execution backend for evaluation runs",
+)
+@click.option("--artifact-repo", help="Dataset repo for remote job artifacts")
+@click.option("--wait/--no-wait", default=False, help="Wait for remote jobs and download results")
+@click.option("--jobs-timeout", default="2h", show_default=True, help="HF Jobs timeout")
+@click.option("--jobs-flavor", default="cpu-basic", show_default=True, help="HF Jobs flavor")
+@click.option(
+    "--jobs-secrets",
+    default="HF_TOKEN",
+    show_default=True,
+    help="Comma-separated HF Job secrets to forward",
+)
+@click.option("--jobs-namespace", help="Optional Hugging Face Jobs namespace")
 @click.option("--log-runs/--no-log-runs", default=True, help="Log run data (default: enabled)")
 @click.option("--runs-dir", type=click.Path(), help="Directory for run logs")
 def eval_cmd(
@@ -793,6 +1015,13 @@ def eval_cmd(
     num_runs: int,
     no_baseline: bool,
     verbose: bool,
+    executor: ExecutorName,
+    artifact_repo: str | None,
+    wait: bool,
+    jobs_timeout: str,
+    jobs_flavor: str,
+    jobs_secrets: str,
+    jobs_namespace: str | None,
     log_runs: bool,
     runs_dir: str | None,
 ):
@@ -830,6 +1059,13 @@ def eval_cmd(
             num_runs,
             no_baseline,
             verbose,
+            executor,
+            artifact_repo,
+            wait,
+            jobs_timeout,
+            jobs_flavor,
+            jobs_secrets,
+            jobs_namespace,
             log_runs,
             runs_dir,
         )
@@ -844,6 +1080,13 @@ async def _eval_async(  # noqa: C901
     num_runs: int,
     no_baseline: bool,
     verbose: bool,
+    executor_name: ExecutorName,
+    artifact_repo: str | None,
+    wait: bool,
+    jobs_timeout: str,
+    jobs_flavor: str,
+    jobs_secrets: str,
+    jobs_namespace: str | None,
     log_runs: bool,
     runs_dir: str | None,
 ):
@@ -851,6 +1094,16 @@ async def _eval_async(  # noqa: C901
     from upskill.evaluate import run_test
 
     config = Config.load()
+    jobs_config = _require_jobs_config(
+        executor_name=executor_name,
+        artifact_repo=artifact_repo,
+        wait=wait,
+        jobs_timeout=jobs_timeout,
+        jobs_flavor=jobs_flavor,
+        jobs_secrets=jobs_secrets,
+        jobs_namespace=jobs_namespace,
+    )
+    executor = _build_executor("local") if executor_name == "local" else None
     resolved = resolve_models(
         "eval",
         config=config,
@@ -884,21 +1137,21 @@ async def _eval_async(  # noqa: C901
         console.print(f"[red]No SKILL.md found in {skill_dir}[/red]")
         sys.exit(1)
 
-    async with _fast_agent_context(config) as agent:
-        # Load test cases
-        test_cases: list[TestCase] = []
-        if tests:
-            with open(tests, encoding="utf-8") as f:
-                data = json.load(f)
-            if "cases" in data:
-                test_cases = [TestCase(**tc) for tc in data["cases"]]
-            else:
-                test_cases = [TestCase(**tc) for tc in data]
-            test_source = f"tests file: {tests}"
-        elif skill.tests:
-            test_cases = skill.tests
-            test_source = "skill_meta.json"
+    # Load test cases
+    test_cases: list[TestCase] = []
+    if tests:
+        with open(tests, encoding="utf-8") as f:
+            data = json.load(f)
+        if "cases" in data:
+            test_cases = [TestCase(**tc) for tc in data["cases"]]
         else:
+            test_cases = [TestCase(**tc) for tc in data]
+        test_source = f"tests file: {tests}"
+    elif skill.tests:
+        test_cases = skill.tests
+        test_source = "skill_meta.json"
+    else:
+        async with _fast_agent_context(config) as agent:
             console.print("Generating test cases from skill...", style="dim")
             await _set_agent_model(agent.test_gen, test_gen_model)
             test_cases = await generate_tests(
@@ -906,27 +1159,144 @@ async def _eval_async(  # noqa: C901
                 generator=agent.test_gen,
                 model=test_gen_model,
             )
-            test_source = "generated"
+        test_source = "generated"
 
-        invalid_expected = 0
-        for tc in test_cases:
-            expected_values = [value.strip() for value in tc.expected.contains if value.strip()]
-            if len(expected_values) < 2:
-                invalid_expected += 1
-        console.print(f"[dim]Loaded {len(test_cases)} test case(s) from {test_source}[/dim]")
-        if invalid_expected:
-            console.print(
-                f"[yellow]{invalid_expected} test case(s) missing expected strings[/yellow]"
+    invalid_expected = 0
+    for tc in test_cases:
+        expected_values = [value.strip() for value in tc.expected.contains if value.strip()]
+        if len(expected_values) < 2:
+            invalid_expected += 1
+    console.print(f"[dim]Loaded {len(test_cases)} test case(s) from {test_source}[/dim]")
+    if invalid_expected:
+        console.print(f"[yellow]{invalid_expected} test case(s) missing expected strings[/yellow]")
+
+    runs_path = Path(runs_dir) if runs_dir else config.runs_dir
+    batch_id, batch_folder = create_batch_folder(runs_path)
+    console.print(f"Artifacts saved to: {batch_folder}", style="dim")
+    if log_runs:
+        console.print(f"Logging to: {batch_folder}", style="dim")
+
+    if executor_name == "jobs":
+        if jobs_config is None:
+            raise RuntimeError("Jobs config was not initialized.")
+        cards = resources.files("upskill").joinpath("agent_cards")
+        with resources.as_file(cards) as cards_path:
+            if resolved.is_benchmark_mode:
+                submitted_job_refs: list[str] = []
+                all_run_results: list[RunResult] = []
+                model_results: dict[str, list[RunResult]] = {
+                    model: [] for model in evaluation_models
+                }
+
+                for model in evaluation_models:
+                    console.print(f"[bold]{model}[/bold]")
+                    for run_num in range(1, num_runs + 1):
+                        remote_results, job_refs = run_remote_eval(
+                            skill=skill,
+                            test_cases=test_cases,
+                            model=model,
+                            jobs_config=jobs_config,
+                            fastagent_config_path=config.effective_fastagent_config,
+                            destination_root=batch_folder
+                            / "remote_downloads"
+                            / model
+                            / f"run_{run_num}",
+                            run_baseline=False,
+                            progress_callback=_print_eval_progress,
+                        )
+                        submitted_job_refs.extend(job_refs)
+                        console.print(f"Remote job id(s): {', '.join(job_refs)}")
+                        if remote_results is None:
+                            continue
+                        run_result = RunResult(
+                            metadata=RunMetadata(
+                                model=model,
+                                task=skill.description,
+                                batch_id=batch_id,
+                                run_number=run_num,
+                            ),
+                            stats=aggregate_conversation_stats(remote_results.with_skill_results),
+                            passed=remote_results.with_skill_success_rate > 0.5,
+                            assertions_passed=int(
+                                remote_results.with_skill_success_rate * len(test_cases)
+                            ),
+                            assertions_total=len(test_cases),
+                            run_type="with_skill",
+                            skill_name=skill.name,
+                        )
+                        all_run_results.append(run_result)
+                        model_results[model].append(run_result)
+
+                if not jobs_config.wait:
+                    console.print(f"Submitted remote job id(s): {', '.join(submitted_job_refs)}")
+                    return
+
+                console.print("\n[bold]Summary[/bold]\n")
+                for model, results in model_results.items():
+                    total_runs = len(results)
+                    passed_runs = sum(1 for r in results if r.passed)
+                    avg_tokens = (
+                        sum(r.stats.total_tokens for r in results) / total_runs if total_runs else 0
+                    )
+                    avg_turns = (
+                        sum(r.stats.turns for r in results) / total_runs if total_runs else 0
+                    )
+                    pass_rate = passed_runs / total_runs if total_runs else 0
+                    pass_rate_str = f"{pass_rate:.0%}"
+                    pass_rate_style = (
+                        "green" if pass_rate > 0.5 else "yellow" if pass_rate > 0 else "red"
+                    )
+                    console.print(f"[bold]{model}[/bold]")
+                    console.print(
+                        "  Runs: "
+                        f"{total_runs} | Passed: {passed_runs} ([{pass_rate_style}]"
+                        f"{pass_rate_str}[/{pass_rate_style}])"
+                    )
+                    console.print(f"  Avg tokens: {avg_tokens:.0f} | Avg turns: {avg_turns:.1f}")
+                    console.print()
+                return
+
+            remote_results, job_refs = run_remote_eval(
+                skill=skill,
+                test_cases=test_cases,
+                model=evaluation_models[0],
+                jobs_config=jobs_config,
+                fastagent_config_path=config.effective_fastagent_config,
+                destination_root=batch_folder / "remote_downloads",
+                run_baseline=resolved.run_baseline,
+                progress_callback=_print_eval_progress,
             )
+        console.print(f"Remote job id(s): {', '.join(job_refs)}")
+        if remote_results is None:
+            return
 
-        # Setup run logging
-        batch_id = None
-        batch_folder = None
-        if log_runs:
-            runs_path = Path(runs_dir) if runs_dir else config.runs_dir
-            batch_id, batch_folder = create_batch_folder(runs_path)
-            console.print(f"Logging to: {batch_folder}", style="dim")
+        console.print()
+        if resolved.run_baseline:
+            baseline_bar = _render_bar(remote_results.baseline_success_rate)
+            with_skill_bar = _render_bar(remote_results.with_skill_success_rate)
+            lift = remote_results.skill_lift
+            lift_str = f"+{lift:.0%}" if lift >= 0 else f"{lift:.0%}"
+            lift_style = "green" if lift > 0 else "red" if lift < 0 else "dim"
+            console.print(
+                f"  baseline   {baseline_bar}  {remote_results.baseline_success_rate:>5.0%}"
+            )
+            console.print(
+                f"  with skill {with_skill_bar}  {remote_results.with_skill_success_rate:>5.0%}  "
+                f"[{lift_style}]({lift_str})[/{lift_style}]"
+            )
+        else:
+            with_skill_bar = _render_bar(remote_results.with_skill_success_rate)
+            console.print(
+                f"  with skill {with_skill_bar}  {remote_results.with_skill_success_rate:>5.0%}"
+            )
+        console.print(f"\nRemote artifacts saved to: {batch_folder / 'remote_downloads'}")
+        return
 
+    if executor is None:
+        raise RuntimeError("Local executor was not initialized.")
+
+    cards = resources.files("upskill").joinpath("agent_cards")
+    with resources.as_file(cards) as cards_path:
         if resolved.is_benchmark_mode:
             # Benchmark mode: multiple models and/or runs
             console.print(
@@ -941,9 +1311,7 @@ async def _eval_async(  # noqa: C901
                 console.print(f"[bold]{model}[/bold]")
 
                 for run_num in range(1, num_runs + 1):
-                    run_folder = None
-                    if log_runs and batch_folder:
-                        run_folder = create_run_folder(batch_folder, len(all_run_results) + 1)
+                    run_folder = create_run_folder(batch_folder, len(all_run_results) + 1)
 
                     # Run each test case
                     total_assertions_passed = 0
@@ -961,9 +1329,12 @@ async def _eval_async(  # noqa: C901
                         try:
                             result = await run_test(
                                 tc,
-                                evaluator=agent.evaluator,
-                                skill=skill,
+                                executor,
+                                skill,
                                 model=model,
+                                fastagent_config_path=config.effective_fastagent_config,
+                                cards_source_dir=cards_path,
+                                artifact_dir=run_folder / "artifacts" / f"test_{tc_idx}",
                                 instance_name=(f"eval ({model} run {run_num} test {tc_idx})"),
                             )
                         except Exception as e:
@@ -998,7 +1369,7 @@ async def _eval_async(  # noqa: C901
                         metadata=RunMetadata(
                             model=model,
                             task=skill.description,
-                            batch_id=batch_id or "",
+                            batch_id=batch_id,
                             run_number=run_num,
                         ),
                         stats=aggregated_stats,
@@ -1009,7 +1380,7 @@ async def _eval_async(  # noqa: C901
                         skill_name=skill.name,
                     )
 
-                    if run_folder:
+                    if log_runs:
                         write_run_metadata(run_folder, run_result.metadata)
                         write_run_result(run_folder, run_result)
 
@@ -1056,7 +1427,7 @@ async def _eval_async(  # noqa: C901
                 console.print()
 
             # Write batch summary
-            if log_runs and batch_folder and batch_id:
+            if log_runs:
                 summary = BatchSummary(
                     batch_id=batch_id,
                     model=", ".join(evaluation_models),
@@ -1075,15 +1446,19 @@ async def _eval_async(  # noqa: C901
             results = await evaluate_skill(
                 skill,
                 test_cases,
-                evaluator=agent.evaluator,
+                executor=executor,
                 model=model,
+                fastagent_config_path=config.effective_fastagent_config,
+                cards_source_dir=cards_path,
+                artifact_root=batch_folder / "eval",
                 run_baseline=resolved.run_baseline,
                 show_baseline_progress=verbose,
+                progress_callback=_print_eval_progress,
             )
 
             # Log results (both baseline and with-skill)
             run_results: list[RunResult] = []
-            if log_runs and batch_folder:
+            if log_runs:
                 # Log baseline result
                 if resolved.run_baseline:
                     baseline_folder = create_run_folder(batch_folder, 1)
@@ -1091,7 +1466,7 @@ async def _eval_async(  # noqa: C901
                         metadata=RunMetadata(
                             model=model,
                             task=skill.description,
-                            batch_id=batch_id or "",
+                            batch_id=batch_id,
                             run_number=1,
                         ),
                         stats=aggregate_conversation_stats(results.baseline_results),
@@ -1114,7 +1489,7 @@ async def _eval_async(  # noqa: C901
                     metadata=RunMetadata(
                         model=model,
                         task=skill.description,
-                        batch_id=batch_id or "",
+                        batch_id=batch_id,
                         run_number=2 if resolved.run_baseline else 1,
                     ),
                     stats=aggregate_conversation_stats(results.with_skill_results),
@@ -1132,7 +1507,7 @@ async def _eval_async(  # noqa: C901
 
                 # Write batch summary
                 summary = BatchSummary(
-                    batch_id=batch_id or "",
+                    batch_id=batch_id,
                     model=model,
                     task=skill.description,
                     total_runs=len(run_results),
@@ -1190,6 +1565,7 @@ async def _eval_async(  # noqa: C901
                 console.print(f"  with skill {with_skill_bar}  {with_skill_rate:>5.0%}")
                 console.print(f"  tokens: {results.with_skill_total_tokens}")
 
+            console.print(f"\nArtifacts saved to: {batch_folder}")
             if resolved.run_baseline:
                 if results.is_beneficial:
                     console.print("\n[green]Recommendation: keep skill[/green]")
@@ -1341,6 +1717,7 @@ async def _benchmark_async(  # noqa: C901
     from upskill.evaluate import run_test
 
     config = Config.load()
+    executor = _build_executor("local")
     resolved = resolve_models(
         "benchmark",
         config=config,
@@ -1364,156 +1741,166 @@ async def _benchmark_async(  # noqa: C901
     skill = Skill.load(Path(skill_path))
 
     async with _fast_agent_context(config) as agent:
-        # Load test cases
-        if tests_path:
-            with open(tests_path, encoding="utf-8") as f:
-                data = json.load(f)
-            if "cases" in data:
-                test_cases = [TestCase(**tc) for tc in data["cases"]]
+        cards = resources.files("upskill").joinpath("agent_cards")
+        with resources.as_file(cards) as cards_path:
+            # Load test cases
+            if tests_path:
+                with open(tests_path, encoding="utf-8") as f:
+                    data = json.load(f)
+                if "cases" in data:
+                    test_cases = [TestCase(**tc) for tc in data["cases"]]
+                else:
+                    test_cases = [TestCase(**tc) for tc in data]
+            elif skill.tests:
+                test_cases = skill.tests
             else:
-                test_cases = [TestCase(**tc) for tc in data]
-        elif skill.tests:
-            test_cases = skill.tests
-        else:
-            console.print("Generating test cases from skill...", style="dim")
-            await _set_agent_model(agent.test_gen, test_gen_model)
-            test_cases = await generate_tests(
-                skill.description,
-                generator=agent.test_gen,
-                model=test_gen_model,
-            )
-
-        # Setup output directory
-        out_path = Path(output_dir) if output_dir else config.runs_dir
-
-        batch_id, batch_folder = create_batch_folder(out_path)
-        console.print(f"Results will be saved to: {batch_folder}", style="dim")
-
-        # Track results per model
-        model_results: dict[str, list[RunResult]] = {m: [] for m in evaluation_models}
-        all_run_results: list[RunResult] = []
-
-        console.print(
-            f"\nBenchmarking [bold]{skill.name}[/bold] across {len(evaluation_models)} model(s)"
-        )
-        console.print(f"  {len(test_cases)} test case(s), {num_runs} run(s) per model\n")
-
-        for model in evaluation_models:
-            console.print(f"[bold]{model}[/bold]")
-
-            for run_num in range(1, num_runs + 1):
-                run_folder = create_run_folder(batch_folder, len(all_run_results) + 1)
-
-                # Run each test case
-                total_assertions_passed = 0
-                total_assertions = 0
-                all_passed = True
-                run_results: list[TestResult] = []
-
-                for tc_idx, tc in enumerate(test_cases, 1):
-                    if verbose:
-                        console.print(f"  Running test {tc_idx}/{len(test_cases)}...", style="dim")
-
-                    try:
-                        result = await run_test(
-                            tc,
-                            evaluator=agent.evaluator,
-                            skill=skill,
-                            model=model,
-                            instance_name=(f"benchmark ({model} run {run_num} test {tc_idx})"),
-                        )
-                    except Exception as e:
-                        console.print(f"  [red]Test error: {e}[/red]")
-                        result = TestResult(test_case=tc, success=False, error=str(e))
-
-                    # Extract assertion counts from validation result
-                    if result.validation_result:
-                        total_assertions_passed += result.validation_result.assertions_passed
-                        total_assertions += result.validation_result.assertions_total
-                        if verbose and result.validation_result.error_message:
-                            console.print(
-                                f"    Validation: {result.validation_result.error_message}",
-                                style="dim",
-                            )
-                    elif result.error:
-                        if verbose:
-                            console.print(f"    Error: {result.error}", style="dim")
-                        # Legacy: count as 1 assertion (failed)
-                        total_assertions += 1
-                    else:
-                        # Legacy: count as 1 assertion
-                        total_assertions += 1
-                        if result.success:
-                            total_assertions_passed += 1
-
-                    run_results.append(result)
-
-                    if not result.success:
-                        all_passed = False
-
-                aggregated_stats = aggregate_conversation_stats(run_results)
-
-                # Create run result
-                run_result = RunResult(
-                    metadata=RunMetadata(
-                        model=model,
-                        task=skill.description,
-                        batch_id=batch_id,
-                        run_number=run_num,
-                    ),
-                    stats=aggregated_stats,
-                    passed=all_passed,
-                    assertions_passed=total_assertions_passed,
-                    assertions_total=total_assertions,
-                    run_type="with_skill",
-                    skill_name=skill.name,
+                console.print("Generating test cases from skill...", style="dim")
+                await _set_agent_model(agent.test_gen, test_gen_model)
+                test_cases = await generate_tests(
+                    skill.description,
+                    generator=agent.test_gen,
+                    model=test_gen_model,
                 )
 
-                write_run_metadata(run_folder, run_result.metadata)
-                write_run_result(run_folder, run_result)
-                model_results[model].append(run_result)
-                all_run_results.append(run_result)
+            # Setup output directory
+            out_path = Path(output_dir) if output_dir else config.runs_dir
 
-                # Display progress
-                status = "[green]PASS[/green]" if all_passed else "[red]FAIL[/red]"
-                if verbose:
-                    console.print(
-                        f"  Run {run_num}: {status} "
-                        f"({total_assertions_passed}/{total_assertions} assertions passed)"
+            batch_id, batch_folder = create_batch_folder(out_path)
+            console.print(f"Results will be saved to: {batch_folder}", style="dim")
+
+            # Track results per model
+            model_results: dict[str, list[RunResult]] = {m: [] for m in evaluation_models}
+            all_run_results: list[RunResult] = []
+
+            console.print(
+                f"\nBenchmarking [bold]{skill.name}[/bold] across {len(evaluation_models)} model(s)"
+            )
+            console.print(f"  {len(test_cases)} test case(s), {num_runs} run(s) per model\n")
+
+            for model in evaluation_models:
+                console.print(f"[bold]{model}[/bold]")
+
+                for run_num in range(1, num_runs + 1):
+                    run_folder = create_run_folder(batch_folder, len(all_run_results) + 1)
+
+                    # Run each test case
+                    total_assertions_passed = 0
+                    total_assertions = 0
+                    all_passed = True
+                    run_results: list[TestResult] = []
+
+                    for tc_idx, tc in enumerate(test_cases, 1):
+                        if verbose:
+                            console.print(
+                                f"  Running test {tc_idx}/{len(test_cases)}...",
+                                style="dim",
+                            )
+
+                        try:
+                            result = await run_test(
+                                tc,
+                                executor,
+                                skill,
+                                model=model,
+                                fastagent_config_path=config.effective_fastagent_config,
+                                cards_source_dir=cards_path,
+                                artifact_dir=run_folder / "artifacts" / f"test_{tc_idx}",
+                                instance_name=(f"benchmark ({model} run {run_num} test {tc_idx})"),
+                            )
+                        except Exception as e:
+                            console.print(f"  [red]Test error: {e}[/red]")
+                            result = TestResult(test_case=tc, success=False, error=str(e))
+
+                        # Extract assertion counts from validation result
+                        if result.validation_result:
+                            total_assertions_passed += result.validation_result.assertions_passed
+                            total_assertions += result.validation_result.assertions_total
+                            if verbose and result.validation_result.error_message:
+                                console.print(
+                                    f"    Validation: {result.validation_result.error_message}",
+                                    style="dim",
+                                )
+                        elif result.error:
+                            if verbose:
+                                console.print(f"    Error: {result.error}", style="dim")
+                            # Legacy: count as 1 assertion (failed)
+                            total_assertions += 1
+                        else:
+                            # Legacy: count as 1 assertion
+                            total_assertions += 1
+                            if result.success:
+                                total_assertions_passed += 1
+
+                        run_results.append(result)
+
+                        if not result.success:
+                            all_passed = False
+
+                    aggregated_stats = aggregate_conversation_stats(run_results)
+
+                    # Create run result
+                    run_result = RunResult(
+                        metadata=RunMetadata(
+                            model=model,
+                            task=skill.description,
+                            batch_id=batch_id,
+                            run_number=run_num,
+                        ),
+                        stats=aggregated_stats,
+                        passed=all_passed,
+                        assertions_passed=total_assertions_passed,
+                        assertions_total=total_assertions,
+                        run_type="with_skill",
+                        skill_name=skill.name,
                     )
 
-        console.print("\n[bold]Summary[/bold]\n")
+                    write_run_metadata(run_folder, run_result.metadata)
+                    write_run_result(run_folder, run_result)
+                    model_results[model].append(run_result)
+                    all_run_results.append(run_result)
 
-        for model, results in model_results.items():
-            total_runs = len(results)
-            passed_runs = sum(1 for r in results if r.passed)
-            avg_tokens = (
-                sum(r.stats.total_tokens for r in results) / total_runs if total_runs else 0
+                    # Display progress
+                    status = "[green]PASS[/green]" if all_passed else "[red]FAIL[/red]"
+                    if verbose:
+                        console.print(
+                            f"  Run {run_num}: {status} "
+                            f"({total_assertions_passed}/{total_assertions} assertions passed)"
+                        )
+
+            console.print("\n[bold]Summary[/bold]\n")
+
+            for model, results in model_results.items():
+                total_runs = len(results)
+                passed_runs = sum(1 for r in results if r.passed)
+                avg_tokens = (
+                    sum(r.stats.total_tokens for r in results) / total_runs if total_runs else 0
+                )
+                avg_turns = sum(r.stats.turns for r in results) / total_runs if total_runs else 0
+
+                pass_rate = passed_runs / total_runs if total_runs else 0
+                pass_rate_str = f"{pass_rate:.0%}"
+                pass_rate_style = (
+                    "green" if pass_rate > 0.5 else "yellow" if pass_rate > 0 else "red"
+                )
+
+                console.print(f"[bold]{model}[/bold]")
+                console.print(
+                    "  Runs: "
+                    f"{total_runs} | Passed: {passed_runs} ([{pass_rate_style}]"
+                    f"{pass_rate_str}[/{pass_rate_style}])"
+                )
+                console.print(f"  Avg tokens: {avg_tokens:.0f} | Avg turns: {avg_turns:.1f}")
+                console.print()
+
+            summary = BatchSummary(
+                batch_id=batch_id,
+                model=", ".join(evaluation_models),
+                task=skill.description,
+                total_runs=len(all_run_results),
+                passed_runs=sum(1 for r in all_run_results if r.passed),
+                results=all_run_results,
             )
-            avg_turns = sum(r.stats.turns for r in results) / total_runs if total_runs else 0
-
-            pass_rate = passed_runs / total_runs if total_runs else 0
-            pass_rate_str = f"{pass_rate:.0%}"
-            pass_rate_style = "green" if pass_rate > 0.5 else "yellow" if pass_rate > 0 else "red"
-
-            console.print(f"[bold]{model}[/bold]")
-            console.print(
-                "  Runs: "
-                f"{total_runs} | Passed: {passed_runs} ([{pass_rate_style}]"
-                f"{pass_rate_str}[/{pass_rate_style}])"
-            )
-            console.print(f"  Avg tokens: {avg_tokens:.0f} | Avg turns: {avg_turns:.1f}")
-            console.print()
-
-        summary = BatchSummary(
-            batch_id=batch_id,
-            model=", ".join(evaluation_models),
-            task=skill.description,
-            total_runs=len(all_run_results),
-            passed_runs=sum(1 for r in all_run_results if r.passed),
-            results=all_run_results,
-        )
-        write_batch_summary(batch_folder, summary)
+            write_batch_summary(batch_folder, summary)
 
 
 @main.command("runs")
