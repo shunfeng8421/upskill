@@ -3,8 +3,13 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
-from fast_agent.skills.registry import SkillManifest, SkillRegistry
+try:
+    from fast_agent.skills.registry import SkillManifest, SkillRegistry
+except ModuleNotFoundError:  # pragma: no cover - enables unit tests without fast-agent
+    SkillManifest = Any
+    SkillRegistry = None
 
 
 def parse_skill_manifest_text(
@@ -21,4 +26,6 @@ def parse_skill_manifest_text(
     Returns:
         Tuple of (SkillManifest | None, error message | None).
     """
+    if SkillRegistry is None:
+        return None, "fast-agent-mcp is required to parse skill manifests."
     return SkillRegistry.parse_manifest_text(manifest_text, path=path)

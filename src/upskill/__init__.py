@@ -2,6 +2,7 @@
 
 __version__ = "0.2.0"
 
+from upskill.ci import load_eval_manifest, run_ci_suite
 from upskill.config import Config
 from upskill.evaluate import evaluate_skill
 from upskill.generate import generate_skill, generate_tests, refine_skill
@@ -16,14 +17,18 @@ from upskill.logging import (
 )
 from upskill.models import (
     BatchSummary,
+    CiReport,
     ConversationStats,
+    EvalManifest,
     EvalResults,
+    EvalScenario,
     RunMetadata,
     RunResult,
     Skill,
     SkillMetadata,
     TestCase,
     TestResult,
+    VerifierSpec,
 )
 
 __all__ = [
@@ -39,12 +44,18 @@ __all__ = [
     "RunResult",
     "ConversationStats",
     "BatchSummary",
+    "VerifierSpec",
+    "EvalScenario",
+    "EvalManifest",
+    "CiReport",
     # Generation
     "generate_skill",
     "generate_tests",
     "refine_skill",
     # Evaluation
     "evaluate_skill",
+    "run_ci_suite",
+    "load_eval_manifest",
     # Logging
     "create_batch_folder",
     "create_run_folder",

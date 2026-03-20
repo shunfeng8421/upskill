@@ -6,8 +6,9 @@ import json
 import re
 from datetime import datetime
 from pathlib import Path
+from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class SkillMetadata(BaseModel):
@@ -20,6 +21,7 @@ class SkillMetadata(BaseModel):
     test_pass_rate: float | None = None
     license: str | None = None
     compatibility: str | None = None
+    candidate_id: str | None = None
 
 
 class ValidationResult(BaseModel):
@@ -31,6 +33,38 @@ class ValidationResult(BaseModel):
     metrics_count: int = 0
     benchmarks_found: list[str] = Field(default_factory=list)
     error_message: str | None = None
+    details: list[str] = Field(default_factory=list)
+
+
+class VerifierSpec(BaseModel):
+    """Deterministic verifier configuration for a test case."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: str
+    name: str | None = None
+    values: list[str] = Field(default_factory=list)
+    path: str | None = None
+    text: str | None = None
+    cmd: str | None = None
+    config: dict[str, str | int | float | bool] | None = None
+
+    @field_validator("values", mode="before")
+    @classmethod
+    def coerce_values(cls, value: str | list[str] | None) -> list[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            return [value]
+        return value
+
+
+class CapturedArtifact(BaseModel):
+    """Text artifact captured from a test workspace."""
+
+    path: str
+    content: str
+    truncated: bool = False
 
 
 class ExpectedSpec(BaseModel):
@@ -63,12 +97,40 @@ class TestCase(BaseModel):
 
     input: str  # Task/prompt to give the agent
     context: TestCaseContext | None = None  # Files, env vars, etc.
-    expected: ExpectedSpec  # Expected output checks
+    expected: ExpectedSpec | None = None  # Legacy expected output checks
+    verifiers: list[VerifierSpec] = Field(default_factory=list)
 
     # Custom validator support
     output_file: str | None = None  # File to validate instead of agent output
     validator: str | None = None  # Validator name (e.g., "hf_eval_yaml")
     validator_config: dict[str, str | int | float | bool] | None = None
+
+    @model_validator(mode="after")
+    def validate_expectations(self) -> TestCase:
+        if self.expected is None and not self.verifiers and self.validator is None:
+            raise ValueError(
+                "TestCase requires at least one of expected, verifiers, or validator."
+            )
+        return self
+
+    def effective_verifiers(self) -> list[VerifierSpec]:
+        """Return normalized verifier specs including legacy fields."""
+        effective = list(self.verifiers)
+        if self.expected is not None and self.expected.contains:
+            effective.insert(
+                0,
+                VerifierSpec(type="contains", values=self.expected.contains),
+            )
+        if self.validator is not None:
+            effective.append(
+                VerifierSpec(
+                    type="validator",
+                    name=self.validator,
+                    path=self.output_file,
+                    config=self.validator_config,
+                )
+            )
+        return effective
 
 
 
@@ -324,6 +386,40 @@ class TestResult(BaseModel):
 
     # Detailed validation results (for custom validators)
     validation_result: ValidationResult | None = None
+    artifacts: list[CapturedArtifact] = Field(default_factory=list)
+
+
+class JudgeCriterionScore(BaseModel):
+    """Score for a single judge rubric criterion."""
+
+    criterion: str
+    score: int = Field(..., ge=1, le=5)
+    rationale: str
+
+
+class JudgeEvaluation(BaseModel):
+    """Structured LLM-as-a-judge evaluation for one executed test."""
+
+    summary: str
+    criteria: list[JudgeCriterionScore] = Field(default_factory=list)
+
+    @property
+    def total_score(self) -> int:
+        """Return the summed rubric score."""
+        return sum(item.score for item in self.criteria)
+
+    @property
+    def max_score(self) -> int:
+        """Return the maximum possible score."""
+        return len(self.criteria) * 5
+
+    @property
+    def normalized_score(self) -> float:
+        """Return the judge score normalized to 0-1."""
+        max_score = self.max_score
+        if max_score == 0:
+            return 0.0
+        return self.total_score / max_score
 
 
 class EvalResults(BaseModel):
@@ -363,6 +459,136 @@ class EvalResults(BaseModel):
         return self.skill_lift > 0.05 or (self.skill_lift >= 0 and self.token_savings > 0.2)
 
 
+class CandidateEvalResult(BaseModel):
+    """Evaluation data for one candidate skill."""
+
+    candidate_id: str
+    skill: Skill
+    test_results: list[TestResult] = Field(default_factory=list)
+    judge_evaluations: list[JudgeEvaluation] = Field(default_factory=list)
+    assertions_passed: int = 0
+    assertions_total: int = 0
+    hard_score: float = 0.0
+    judge_score: float = 0.0
+    token_efficiency_score: float = 0.0
+    composite_score: float = 0.0
+    hard_gate_failed: bool = False
+    average_tokens: float = 0.0
+    average_turns: float = 0.0
+
+
+class RankedSkillResult(BaseModel):
+    """Ranked wrapper around one candidate result."""
+
+    rank: int
+    candidate: CandidateEvalResult
+    judge_model: str | None = None
+    judge_summary: str | None = None
+    score_margin_from_next: float | None = None
+
+
+class RankedSkillBatch(BaseModel):
+    """Full ranking output for one candidate generation batch."""
+
+    task: str
+    skill_generation_model: str
+    evaluation_model: str
+    judge_model: str | None = None
+    judge_strategy: str = "pointwise"
+    candidate_count: int = 0
+    ranked_results: list[RankedSkillResult] = Field(default_factory=list)
+    tests: list[TestCase] = Field(default_factory=list)
+
+    @property
+    def winner(self) -> RankedSkillResult | None:
+        """Return the highest-ranked candidate."""
+        if not self.ranked_results:
+            return None
+        return self.ranked_results[0]
+
+
+class ScenarioJudgeConfig(BaseModel):
+    """Judge configuration for a scenario."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    criteria: list[str] | None = None
+
+
+class EvalScenario(BaseModel):
+    """Scenario definition for CI evaluation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(..., min_length=1)
+    skills: list[str] = Field(default_factory=list)
+    tests: str
+    judge: ScenarioJudgeConfig | None = None
+    include_baseline: bool = False
+
+
+class EvalManifest(BaseModel):
+    """Top-level CI manifest."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    scenarios: list[EvalScenario] = Field(default_factory=list)
+
+
+class ScenarioVariantResult(BaseModel):
+    """Aggregate result for one scenario variant."""
+
+    variant_id: str
+    variant_type: Literal["bundle", "ablation", "baseline"]
+    skills: list[str] = Field(default_factory=list)
+    omitted_skill: str | None = None
+    passed: bool
+    assertions_passed: int = 0
+    assertions_total: int = 0
+    hard_score: float = 0.0
+    judge_score: float | None = None
+    judge_summary: str | None = None
+    total_tokens: int = 0
+    average_turns: float = 0.0
+    run_folder: str | None = None
+
+
+class ScenarioContribution(BaseModel):
+    """Contribution delta for leaving one skill out of a bundle."""
+
+    skill: str
+    hard_score_delta: float = 0.0
+    judge_score_delta: float | None = None
+    passed_without_skill: bool = False
+
+
+class ScenarioReport(BaseModel):
+    """Report for one selected scenario."""
+
+    scenario_id: str
+    skills: list[str] = Field(default_factory=list)
+    tests_path: str
+    passed: bool
+    bundle: ScenarioVariantResult
+    ablations: list[ScenarioVariantResult] = Field(default_factory=list)
+    baseline: ScenarioVariantResult | None = None
+    contributions: list[ScenarioContribution] = Field(default_factory=list)
+
+
+class CiReport(BaseModel):
+    """Machine-readable report for a CI evaluation run."""
+
+    manifest_path: str
+    scope: str
+    base_ref: str | None = None
+    changed_files: list[str] = Field(default_factory=list)
+    changed_skills: list[str] = Field(default_factory=list)
+    selected_scenarios: list[str] = Field(default_factory=list)
+    success: bool = True
+    scenarios: list[ScenarioReport] = Field(default_factory=list)
+
+
 # Run logging models (similar to skills-test)
 
 
@@ -391,6 +617,16 @@ class RunResult(BaseModel):
     # For plot command: distinguish baseline vs with-skill runs
     run_type: str = "with_skill"  # "with_skill" | "baseline"
     skill_name: str | None = None  # Name of the skill being evaluated
+    judge_model: str | None = None
+    judge_score: float | None = None
+    judge_summary: str | None = None
+    candidate_id: str | None = None
+    rank: int | None = None
+    scenario_id: str | None = None
+    variant_id: str | None = None
+    variant_type: str | None = None
+    skills: list[str] = Field(default_factory=list)
+    omitted_skill: str | None = None
 
 
 class BatchSummary(BaseModel):

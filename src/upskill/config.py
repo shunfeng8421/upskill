@@ -120,6 +120,13 @@ class Config(BaseModel):
         default=None,
         description="Model for test generation (defaults to skill generation model)",
     )
+    judge_model: str | None = Field(
+        default=None,
+        description=(
+            "Model for LLM-as-a-judge ranking "
+            "(defaults to eval_model or skill generation model)"
+        ),
+    )
 
     # Directory settings
     skills_dir: Path = Field(
@@ -132,6 +139,12 @@ class Config(BaseModel):
     # Generation settings
     auto_eval: bool = Field(default=True, description="Run eval after generation")
     max_refine_attempts: int = Field(default=2, description="Max refinement iterations")
+    default_candidate_count: int = Field(
+        default=1,
+        description="Default number of candidate skills to generate per task",
+    )
+    judge_strategy: str = Field(default="pointwise", description="Judge ranking strategy")
+    judge_weight: float = Field(default=0.3, description="Weight for judge score in ranking")
 
     # FastAgent settings
     fastagent_config: Path | None = Field(default=None, description="Path to fastagent.config.yaml")
@@ -175,6 +188,11 @@ class Config(BaseModel):
     def effective_eval_model(self) -> str:
         """Get the model to use for evaluation."""
         return self.eval_model or self.skill_generation_model
+
+    @property
+    def effective_judge_model(self) -> str:
+        """Get the model to use for judge-based ranking."""
+        return self.judge_model or self.effective_eval_model
 
     @property
     def model(self) -> str:

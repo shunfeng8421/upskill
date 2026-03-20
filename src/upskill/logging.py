@@ -6,12 +6,28 @@ import csv
 import json
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
-from fast_agent import ConversationSummary
-from fast_agent.constants import FAST_AGENT_TIMING, FAST_AGENT_USAGE
-from fast_agent.mcp.helpers.content_helpers import get_text
+try:
+    from fast_agent import ConversationSummary
+    from fast_agent.constants import FAST_AGENT_TIMING, FAST_AGENT_USAGE
+    from fast_agent.mcp.helpers.content_helpers import get_text
+except ModuleNotFoundError:  # pragma: no cover - enables unit tests without fast-agent
+    ConversationSummary = Any
+    FAST_AGENT_TIMING = "fast-agent-timing"
+    FAST_AGENT_USAGE = "fast-agent-usage"
 
-from upskill.models import BatchSummary, ConversationStats, RunMetadata, RunResult, TestResult
+    def get_text(content: object) -> str | None:
+        return getattr(content, "text", None)
+
+from upskill.models import (
+    BatchSummary,
+    ConversationStats,
+    RankedSkillBatch,
+    RunMetadata,
+    RunResult,
+    TestResult,
+)
 
 # CSV field names for run summaries (matching skills-test format)
 FIELDNAMES = [
@@ -103,6 +119,27 @@ def load_run_result(run_folder: Path) -> RunResult | None:
     try:
         data = json.loads(result_path.read_text(encoding="utf-8"))
         return RunResult(**data)
+    except (json.JSONDecodeError, ValueError):
+        return None
+
+
+def write_ranking_summary(batch_folder: Path, ranking: RankedSkillBatch) -> None:
+    """Write candidate ranking output to JSON."""
+    path = batch_folder / "ranking_summary.json"
+    path.write_text(
+        json.dumps(ranking.model_dump(mode="json"), indent=2),
+        encoding="utf-8",
+    )
+
+
+def load_ranking_summary(batch_folder: Path) -> RankedSkillBatch | None:
+    """Load candidate ranking output from JSON."""
+    path = batch_folder / "ranking_summary.json"
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return RankedSkillBatch(**data)
     except (json.JSONDecodeError, ValueError):
         return None
 

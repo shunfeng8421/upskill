@@ -1,0 +1,119 @@
+name: upskill-ci
+description: Run upskill scenario-based CI evaluation for changed or declared skill bundles.
+
+inputs:
+  manifest-path:
+    description: Path to the upskill scenario manifest, relative to the working directory.
+    required: false
+    default: .upskill/evals.yaml
+  scope:
+    description: Run only changed scenarios or the entire manifest.
+    required: false
+    default: changed
+  base-ref:
+    description: Git base ref used when scope is changed.
+    required: false
+    default: origin/main
+  eval-model:
+    description: Model used for evaluator execution.
+    required: false
+  judge-model:
+    description: Model used for advisory judge scoring.
+    required: false
+  working-directory:
+    description: Repository directory where the manifest and skills live.
+    required: false
+    default: .
+  runs-dir:
+    description: Directory, relative to the working directory, for run artifacts.
+    required: false
+    default: runs
+  summary-json:
+    description: JSON report path, relative to the working directory.
+    required: false
+    default: upskill-report.json
+  fail-on-no-scenarios:
+    description: Exit non-zero when no scenarios are selected.
+    required: false
+    default: "false"
+  upload-artifacts:
+    description: Upload the JSON report and run artifacts.
+    required: false
+    default: "true"
+
+outputs:
+  summary-json:
+    description: Path to the generated JSON report.
+    value: ${{ steps.paths.outputs.summary_json }}
+  runs-dir:
+    description: Path to the generated run artifacts directory.
+    value: ${{ steps.paths.outputs.runs_dir }}
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.13"
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v5
+
+    - name: Resolve output paths
+      id: paths
+      shell: bash
+      run: |
+        set -euo pipefail
+        workdir="${{ inputs.working-directory }}"
+        summary_json="${workdir}/${{ inputs.summary-json }}"
+        runs_dir="${workdir}/${{ inputs.runs-dir }}"
+        echo "summary_json=${summary_json}" >> "$GITHUB_OUTPUT"
+        echo "runs_dir=${runs_dir}" >> "$GITHUB_OUTPUT"
+
+    - name: Install upskill from action source
+      shell: bash
+      run: |
+        set -euo pipefail
+        uv pip install --system "${{ github.action_path }}"
+
+    - name: Run upskill ci
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        set -euo pipefail
+        args=(
+          --manifest "${{ inputs.manifest-path }}"
+          --scope "${{ inputs.scope }}"
+          --base-ref "${{ inputs.base-ref }}"
+          --runs-dir "${{ inputs.runs-dir }}"
+          --summary-json "${{ inputs.summary-json }}"
+        )
+        if [[ -n "${{ inputs.eval-model }}" ]]; then
+          args+=(--eval-model "${{ inputs.eval-model }}")
+        fi
+        if [[ -n "${{ inputs.judge-model }}" ]]; then
+          args+=(--judge-model "${{ inputs.judge-model }}")
+        fi
+        if [[ "${{ inputs.fail-on-no-scenarios }}" == "true" ]]; then
+          args+=(--fail-on-no-scenarios)
+        else
+          args+=(--no-fail-on-no-scenarios)
+        fi
+        upskill ci "${args[@]}"
+
+    - name: Upload CI report
+      if: ${{ always() && inputs.upload-artifacts == 'true' }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: upskill-report
+        path: ${{ steps.paths.outputs.summary_json }}
+        if-no-files-found: error
+
+    - name: Upload run artifacts
+      if: ${{ always() && inputs.upload-artifacts == 'true' }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: upskill-runs
+        path: ${{ steps.paths.outputs.runs_dir }}
+        if-no-files-found: warn

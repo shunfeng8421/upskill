@@ -40,3 +40,20 @@ jobs:
 
       - name: Run tests
         run: uv run pytest -v
+
+  action-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run local upskill action against fixture repo
+        uses: ./
+        with:
+          working-directory: tests/fixtures/ci_action_repo
+          scope: changed
+          base-ref: HEAD
+          summary-json: upskill-report.json
+          fail-on-no-scenarios: "false"
+
+      - name: Verify smoke report exists
+        run: test -f tests/fixtures/ci_action_repo/upskill-report.json

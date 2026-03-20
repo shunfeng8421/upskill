@@ -3,9 +3,14 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import Any
 
-from fast_agent.interfaces import AgentProtocol
-from fast_agent.skills.registry import SkillManifest
+try:
+    from fast_agent.interfaces import AgentProtocol
+    from fast_agent.skills.registry import SkillManifest
+except ModuleNotFoundError:  # pragma: no cover - enables unit tests without fast-agent
+    AgentProtocol = Any
+    SkillManifest = Any
 
 from upskill.manifest_utils import parse_skill_manifest_text
 from upskill.models import Skill, SkillMetadata, TestCase, TestCaseSuite
@@ -126,6 +131,35 @@ async def generate_skill(
         model=model,
         source_task=task,
     )
+
+
+async def generate_skill_candidates(
+    task: str,
+    generator: AgentProtocol,
+    count: int,
+    examples: list[str] | None = None,
+    model: str | None = None,
+) -> list[Skill]:
+    """Generate multiple candidate skills for the same task."""
+
+    candidates: list[Skill] = []
+    total = max(1, count)
+    for index in range(total):
+        variant_task = (
+            f"{task}\n\n"
+            f"Candidate variant {index + 1} of {total}. Produce a distinct but valid skill "
+            "that teaches the same task. Vary structure, examples, and phrasing while keeping "
+            "the behavior correct and practical."
+        )
+        skill = await generate_skill(
+            task=variant_task,
+            examples=examples,
+            generator=generator,
+            model=model,
+        )
+        skill.metadata.candidate_id = f"candidate-{index + 1}"
+        candidates.append(skill)
+    return candidates
 
 
 async def generate_tests(

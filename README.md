@@ -216,6 +216,71 @@ sonnet
 ]
 ```
 
+### `upskill ci`
+
+Run scenario-based CI evaluation for changed or declared skill bundles.
+
+```bash
+upskill ci [OPTIONS]
+```
+
+**Options:**
+- `--manifest PATH` - Scenario manifest (default: `./.upskill/evals.yaml`)
+- `--scope [changed|all]` - Run only impacted scenarios or the full suite
+- `--base-ref REF` - Base ref for changed-skill selection (default: `origin/main`)
+- `--eval-model MODEL` - Evaluator model override
+- `--judge-model MODEL` - Judge model override
+- `--summary-json PATH` - Output path for the machine-readable report
+- `--runs-dir PATH` - Directory for run artifacts
+- `--fail-on-no-scenarios / --no-fail-on-no-scenarios` - Control empty-selection behavior
+
+**Scenario manifest example:**
+
+```yaml
+scenarios:
+  - id: hf-model-card-readme
+    skills:
+      - skills/hugging-face-evaluation-manager
+      - skills/hf-cli
+    tests: evals/hf-model-card-readme.yaml
+    judge:
+      enabled: true
+```
+
+**Test suite example:**
+
+```yaml
+cases:
+  - input: "Read README and write olmo_7b_evaluations.yaml"
+    output_file: olmo_7b_evaluations.yaml
+    verifiers:
+      - type: file_exists
+        path: olmo_7b_evaluations.yaml
+      - type: command
+        cmd: python test_eval_assertions.py
+```
+
+The CI command runs the full declared bundle, then leave-one-out ablations for each
+contributing skill. Deterministic verifiers gate pass/fail; judge scoring is advisory.
+
+## GitHub Action
+
+Use the reusable action from another repository after `actions/checkout`:
+
+```yaml
+- uses: huggingface/upskill@vX
+  with:
+    working-directory: .
+    manifest-path: .upskill/evals.yaml
+    scope: changed
+    base-ref: origin/main
+    eval-model: haiku
+    judge-model: openai.gpt-4.1-mini
+```
+
+The action installs `upskill` from the tagged action source, writes `upskill-report.json`
+by default, and uploads the JSON report plus run artifacts.
+
 ### `upskill list`
 
 List all generated skills in a tree view.

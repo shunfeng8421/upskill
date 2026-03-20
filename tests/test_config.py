@@ -46,3 +46,23 @@ def test_config_save_uses_env_override_path_when_file_is_missing(tmp_path, monke
         saved = yaml.safe_load(f) or {}
 
     assert saved["skill_generation_model"] == "haiku"
+
+
+def test_effective_judge_model_falls_back_to_eval_then_generation_model() -> None:
+    config = Config(skill_generation_model="sonnet", eval_model="haiku")
+
+    assert config.effective_judge_model == "haiku"
+
+    config = Config(skill_generation_model="sonnet", eval_model=None, judge_model=None)
+
+    assert config.effective_judge_model == "sonnet"
+
+
+def test_effective_judge_model_prefers_explicit_judge_model() -> None:
+    config = Config(
+        skill_generation_model="sonnet",
+        eval_model="haiku",
+        judge_model="opus",
+    )
+
+    assert config.effective_judge_model == "opus"
