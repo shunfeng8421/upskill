@@ -62,3 +62,12 @@ def test_default_guarded_cards_have_no_model_pin() -> None:
             f"Unexpected model pin in guarded card {card_name}. "
             "Model selection should come from runtime resolution."
         )
+
+
+def test_evaluator_card_does_not_pin_skills_dir() -> None:
+    """Evaluation skill loading should come from --skills-dir, not card frontmatter."""
+    frontmatter = _parse_frontmatter(AGENT_CARDS_DIR / "evaluator.md")
+    assert "skills" not in frontmatter, (
+        "evaluator.md should not define `skills:` in frontmatter. "
+        "Evaluation availability must be controlled by the executor's --skills-dir."
+    )
