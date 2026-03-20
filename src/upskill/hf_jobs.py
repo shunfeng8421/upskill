@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import re
 import shutil
@@ -9,7 +10,7 @@ import subprocess
 import tarfile
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -629,57 +630,69 @@ def run_remote_eval(
 ) -> tuple[EvalResults | None, list[str]]:
     """Run remote fast-agent batches and reconstruct ``EvalResults`` locally."""
     job_refs: list[str] = []
-    with_skill_result = submit_fast_agent_eval_job(
+    submission_config = replace(jobs_config, wait=False)
+    timeout_seconds = parse_duration_seconds(jobs_config.jobs_timeout)
+
+    with_skill_submission = submit_fast_agent_eval_job(
         skill=skill,
         test_cases=test_cases,
         fastagent_config_path=fastagent_config_path,
         model=model,
-        jobs_config=jobs_config,
+        jobs_config=submission_config,
         destination_root=destination_root / "with-skill",
         phase_label="with-skill",
         progress_callback=progress_callback,
     )
-    if isinstance(with_skill_result, SubmittedJob):
-        job_refs.append(with_skill_result.job_id)
-        if run_baseline:
-            baseline_submission = submit_fast_agent_eval_job(
-                skill=None,
-                test_cases=test_cases,
-                fastagent_config_path=fastagent_config_path,
-                model=model,
-                jobs_config=jobs_config,
-                destination_root=destination_root / "baseline",
-                phase_label="baseline",
-                progress_callback=progress_callback,
-            )
-            if isinstance(baseline_submission, SubmittedJob):
-                job_refs.append(baseline_submission.job_id)
-        return None, job_refs
+    assert isinstance(with_skill_submission, SubmittedJob)
+    job_refs.append(with_skill_submission.job_id)
 
-    job_refs.append(with_skill_result.job.job_id)
-    results = EvalResults(skill_name=skill.name, model=model)
-    results.with_skill_results = reconstruct_remote_eval_results(
-        output_dir=with_skill_result.output_dir,
-        test_cases=test_cases,
-    )
+    jobs_to_collect: list[tuple[str, SubmittedJob, Path]] = [
+        ("with-skill", with_skill_submission, destination_root / "with-skill")
+    ]
 
     if run_baseline:
-        baseline_result = submit_fast_agent_eval_job(
+        baseline_submission = submit_fast_agent_eval_job(
             skill=None,
             test_cases=test_cases,
             fastagent_config_path=fastagent_config_path,
             model=model,
-            jobs_config=jobs_config,
+            jobs_config=submission_config,
             destination_root=destination_root / "baseline",
             phase_label="baseline",
             progress_callback=progress_callback,
         )
-        if isinstance(baseline_result, SubmittedJob):
-            job_refs.append(baseline_result.job_id)
-            return None, job_refs
-        job_refs.append(baseline_result.job.job_id)
+        assert isinstance(baseline_submission, SubmittedJob)
+        job_refs.append(baseline_submission.job_id)
+        jobs_to_collect.append(("baseline", baseline_submission, destination_root / "baseline"))
+
+    if not jobs_config.wait:
+        return None, job_refs
+
+    collected_outputs: dict[str, Path] = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(jobs_to_collect)) as executor:
+        future_map = {
+            executor.submit(
+                wait_for_job_outputs,
+                submission,
+                destination_root=collect_root,
+                wait_timeout_seconds=timeout_seconds,
+                progress_callback=progress_callback,
+            ): label
+            for label, submission, collect_root in jobs_to_collect
+        }
+        for future in concurrent.futures.as_completed(future_map):
+            label = future_map[future]
+            collected_outputs[label] = future.result()
+
+    results = EvalResults(skill_name=skill.name, model=model)
+    results.with_skill_results = reconstruct_remote_eval_results(
+        output_dir=collected_outputs["with-skill"],
+        test_cases=test_cases,
+    )
+
+    if run_baseline:
         results.baseline_results = reconstruct_remote_eval_results(
-            output_dir=baseline_result.output_dir,
+            output_dir=collected_outputs["baseline"],
             test_cases=test_cases,
         )
 

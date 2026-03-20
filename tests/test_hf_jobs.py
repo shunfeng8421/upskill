@@ -12,9 +12,11 @@ from upskill.hf_jobs import (
     _parse_submission_payload,
     build_submit_eval_job_command,
     parse_duration_seconds,
+    run_remote_eval,
     submit_eval_job,
     wait_for_job_outputs,
 )
+from upskill.models import ExpectedSpec, Skill, TestCase
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -168,3 +170,69 @@ def test_wait_for_job_outputs_raises_when_job_enters_error_stage(
             wait_timeout_seconds=1.0,
             poll_interval_seconds=0.01,
         )
+
+
+def test_run_remote_eval_submits_with_skill_and_baseline_before_waiting(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+
+    skill = Skill(
+        name="pull-request-descriptions",
+        description="Write good pull request descriptions.",
+        body="Use a clear structure.",
+    )
+    test_cases = [TestCase(input="prompt", expected=ExpectedSpec(contains=["answer"]))]
+
+    def fake_submit_fast_agent_eval_job(**kwargs: object) -> SubmittedJob:
+        phase_label = kwargs["phase_label"]
+        events.append(f"submit:{phase_label}")
+        return SubmittedJob(
+            job_id=f"evalstate/{phase_label}-job",
+            run_id=f"{phase_label}-run",
+            artifact_repo="ns/repo",
+        )
+
+    def fake_wait_for_job_outputs(
+        job: SubmittedJob,
+        *,
+        destination_root: Path,
+        wait_timeout_seconds: float,
+        progress_callback: object = None,
+    ) -> Path:
+        del wait_timeout_seconds, progress_callback
+        events.append(f"wait:{job.run_id}")
+        output_dir = destination_root / "outputs" / job.run_id
+        output_dir.mkdir(parents=True, exist_ok=True)
+        results_dir = output_dir / "results"
+        status_dir = output_dir / "status"
+        results_dir.mkdir()
+        status_dir.mkdir()
+        result_file = results_dir / "test_1.json"
+        result_file.write_text(
+            '{"messages":[{"role":"assistant","content":[{"type":"text","text":"answer"}]}]}',
+            encoding="utf-8",
+        )
+        (status_dir / "test_1.exit_code.txt").write_text("0\n", encoding="utf-8")
+        return output_dir
+
+    monkeypatch.setattr(
+        "upskill.hf_jobs.submit_fast_agent_eval_job", fake_submit_fast_agent_eval_job
+    )
+    monkeypatch.setattr("upskill.hf_jobs.wait_for_job_outputs", fake_wait_for_job_outputs)
+
+    results, job_refs = run_remote_eval(
+        skill=skill,
+        test_cases=test_cases,
+        model="qwen35",
+        jobs_config=JobsConfig(artifact_repo="ns/repo", wait=True),
+        fastagent_config_path=tmp_path / "fastagent.config.yaml",
+        destination_root=tmp_path / "remote",
+        run_baseline=True,
+    )
+
+    assert results is not None
+    assert job_refs == ["evalstate/with-skill-job", "evalstate/baseline-job"]
+    assert events[:2] == ["submit:with-skill", "submit:baseline"]
+    assert sorted(events[2:]) == ["wait:baseline-run", "wait:with-skill-run"]
