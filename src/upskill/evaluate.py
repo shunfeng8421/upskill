@@ -3,20 +3,20 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
 import logging
 import shutil
 import tempfile
-from collections.abc import Generator
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager, nullcontext, suppress
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 from fast_agent import ConversationSummary
-from fast_agent.agents.llm_agent import LlmAgent
 
-try:
-    from fast_agent.ui.rich_progress import progress_display
-except Exception:  # pragma: no cover - defensive import for older fast-agent versions
-    progress_display = None
+if TYPE_CHECKING:
+    from collections.abc import Generator
+
+    from fast_agent.agents.llm_agent import LlmAgent
 
 from upskill.fastagent_integration import (
     compose_instruction,
@@ -33,6 +33,13 @@ from upskill.models import (
 )
 from upskill.validators import get_validator
 
+try:
+    rich_progress: Any | None = importlib.import_module("fast_agent.ui.rich_progress")
+except Exception:  # pragma: no cover - defensive import for older fast-agent versions
+    rich_progress = None
+
+progress_display: Any | None = getattr(rich_progress, "progress_display", None)
+
 
 def _hide_progress_task(task_name: str | None) -> None:
     """Best-effort hide of a completed task from the shared progress display."""
@@ -46,6 +53,7 @@ def _hide_progress_task(task_name: str | None) -> None:
     except Exception:
         # Progress cleanup is best-effort and should never fail evaluations.
         return
+
 
 logger = logging.getLogger(__name__)
 
@@ -72,10 +80,8 @@ def isolated_workspace(base_dir: Path | None = None, cleanup: bool = True) -> Ge
         yield workspace_path
     finally:
         if cleanup:
-            try:
+            with suppress(Exception):
                 shutil.rmtree(workspace_path, ignore_errors=True)
-            except Exception:
-                pass  # Ignore cleanup errors
 
 
 def check_expected(
@@ -253,8 +259,12 @@ async def evaluate_skill(
     Returns:
         EvalResults comparing skill vs baseline
     """
+    resolved_model = model
+    if resolved_model is None:
+        evaluator_model = getattr(evaluator, "model", None)
+        resolved_model = evaluator_model if isinstance(evaluator_model, str) else "unknown"
 
-    results = EvalResults(skill_name=skill.name, model=model)
+    results = EvalResults(skill_name=skill.name, model=resolved_model)
 
     base_instruction = evaluator.instruction
 
@@ -285,9 +295,7 @@ async def evaluate_skill(
     # Calculate with-skill metrics
     successes = sum(1 for r in results.with_skill_results if r.success)
     results.with_skill_success_rate = successes / len(test_cases) if test_cases else 0
-    results.with_skill_total_tokens = sum(
-        r.stats.total_tokens for r in results.with_skill_results
-    )
+    results.with_skill_total_tokens = sum(r.stats.total_tokens for r in results.with_skill_results)
     results.with_skill_avg_turns = (
         sum(r.stats.turns for r in results.with_skill_results) / len(test_cases)
         if test_cases
@@ -307,9 +315,7 @@ async def evaluate_skill(
 
         successes = sum(1 for r in results.baseline_results if r.success)
         results.baseline_success_rate = successes / len(test_cases) if test_cases else 0
-        results.baseline_total_tokens = sum(
-            r.stats.total_tokens for r in results.baseline_results
-        )
+        results.baseline_total_tokens = sum(r.stats.total_tokens for r in results.baseline_results)
         results.baseline_avg_turns = (
             sum(r.stats.turns for r in results.baseline_results) / len(test_cases)
             if test_cases

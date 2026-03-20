@@ -6,9 +6,10 @@ This module centralizes command-specific model fallback and mode selection logic
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
-from upskill.config import Config
+if TYPE_CHECKING:
+    from upskill.config import Config
 
 CommandName = Literal["generate", "eval", "benchmark"]
 

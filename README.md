@@ -42,6 +42,43 @@ View the results later.
 upskill runs --skill git-commit-messages
 ```
 
+## Development checks
+
+This repo uses a CI flow inspired by `fast-agent` with separate format, lint, typecheck, and test
+stages.
+
+Install dev dependencies:
+
+```bash
+uv sync --extra dev
+```
+
+Run the quality gates locally:
+
+```bash
+uv run scripts/format.py
+uv run scripts/lint.py
+uv run scripts/typecheck.py
+uv run --extra dev pytest -v
+```
+
+To auto-format before re-running checks:
+
+```bash
+uv run --extra dev scripts/format.py --write
+```
+
+Current enforced standards:
+
+- `ruff format --check` for formatting
+- `ruff check` for style, imports, modernization, bugbear, simplify, and import-hygiene rules
+- cyclomatic complexity via Ruff `C90` with `max-complexity = 15`
+- `ty check` across `src`, `tests`, and `scripts`
+- `pytest` for the test suite
+
+CI enforcement lives in `.github/workflows/ci.yml` and runs on pushes and pull requests targeting
+`main`.
+
 ## Model Handling Overview
 
 upskill uses distinct phases with explicit model roles:

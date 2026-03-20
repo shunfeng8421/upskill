@@ -5,13 +5,17 @@ from __future__ import annotations
 import csv
 import json
 from datetime import datetime
-from pathlib import Path
+from typing import TYPE_CHECKING
 
-from fast_agent import ConversationSummary
 from fast_agent.constants import FAST_AGENT_TIMING, FAST_AGENT_USAGE
 from fast_agent.mcp.helpers.content_helpers import get_text
 
 from upskill.models import BatchSummary, ConversationStats, RunMetadata, RunResult, TestResult
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+    from fast_agent import ConversationSummary
 
 # CSV field names for run summaries (matching skills-test format)
 FIELDNAMES = [
@@ -174,9 +178,6 @@ def extract_tokens_from_messages(
     return input_tokens, output_tokens, total_tokens, usage_summaries
 
 
-
-
-
 def extract_timing_from_messages(messages: list) -> list[dict[str, object]]:
     """Extract timing payloads from message channels."""
     timings: list[dict[str, object]] = []
@@ -248,8 +249,6 @@ def extract_stats_from_summary(summary: ConversationSummary) -> ConversationStat
         usage_summaries=usage_summaries,
         timing_summaries=timing_summaries,
     )
-
-
 
 
 def aggregate_conversation_stats(results: list[TestResult]) -> ConversationStats:

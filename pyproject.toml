@@ -6,7 +6,7 @@ readme = "README.md"
 requires-python = ">=3.13.5,<3.14"
 dependencies = [
     "click>=8.1",
-    "fast-agent-mcp>=0.4.53",
+    "fast-agent-mcp>=0.6.2",
     "pydantic>=2.0",
     "python-dotenv>=1.0",
     "pyyaml>=6.0",
@@ -21,7 +21,8 @@ Repository = "https://github.com/huggingface/upskill"
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
-    "ruff>=0.4",
+    "ruff>=0.11",
+    "ty>=0.0.23",
 ]
 
 [project.scripts]
@@ -39,4 +40,21 @@ line-length = 100
 target-version = "py313"
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP"]
+select = [
+    "B",
+    "C90",
+    "E",
+    "F",
+    "I",
+    "RUF",
+    "SIM",
+    "TCH",
+    "UP",
+]
+ignore = ["E501"]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 15
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

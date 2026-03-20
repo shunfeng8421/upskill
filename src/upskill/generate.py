@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
-
-from fast_agent.interfaces import AgentProtocol
-from fast_agent.skills.registry import SkillManifest
+from typing import TYPE_CHECKING
 
 from upskill.manifest_utils import parse_skill_manifest_text
 from upskill.models import Skill, SkillMetadata, TestCase, TestCaseSuite
+
+if TYPE_CHECKING:
+    from fast_agent.interfaces import AgentProtocol
+    from fast_agent.skills.registry import SkillManifest
 
 # Few-shot examples for test generation
 TEST_EXAMPLES = """
@@ -72,16 +74,16 @@ TEST_GENERATION_PROMPT = (
     "## Your Task\n\n"
     f"Task: {TASK_PLACEHOLDER}\n\n"
     "Generate test cases that verify the agent can apply the skill correctly.\n\n"
-
     "Each TestCase MUST include at least a list of expected strings in the expected field.\n"
     "Focus on practical scenarios that test understanding of the core concepts."
 )
+
 
 def _build_skill_from_manifest(
     manifest: SkillManifest,
     *,
     model: str | None,
-    source_task: str,
+    source_task: str | None,
     base_skill: Skill | None = None,
 ) -> Skill:
     references = base_skill.references if base_skill else {}
@@ -114,7 +116,6 @@ async def generate_skill(
         prompt += "\n\nExample input/output pairs for this task:\n" + "\n".join(
             f"- {ex}" for ex in examples
         )
-
 
     skill_text = await generator.send(prompt)
     manifest, error = parse_skill_manifest_text(skill_text)
@@ -250,7 +251,6 @@ async def improve_skill(
         body=skill.body,
         instructions=instructions,
     )
-
 
     skill_text = await generator.send(prompt)
     manifest, error = parse_skill_manifest_text(skill_text)

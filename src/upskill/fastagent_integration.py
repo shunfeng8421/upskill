@@ -13,4 +13,3 @@ def compose_instruction(instruction: str, skill: Skill | None) -> str:
     if not skill:
         return instruction
     return f"{instruction}\n\n## Skill: {skill.name}\n\n{skill.body}"
-

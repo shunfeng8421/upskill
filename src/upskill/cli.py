@@ -1,15 +1,15 @@
 """CLI interface for upskill."""
+
 from __future__ import annotations
 
 import asyncio
 import inspect
 import json
 import sys
-from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from importlib import resources
 from pathlib import Path
-from typing import TypedDict
+from typing import TYPE_CHECKING, Literal, Protocol, TypedDict, cast
 
 import click
 from dotenv import load_dotenv
@@ -36,6 +36,7 @@ from upskill.logging import (
 from upskill.model_resolution import ResolvedModels, resolve_models
 from upskill.models import (
     BatchSummary,
+    EvalResults,
     RunMetadata,
     RunResult,
     Skill,
@@ -43,13 +44,30 @@ from upskill.models import (
     TestResult,
 )
 
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
+
+    from fast_agent.agents.llm_agent import LlmAgent
+    from fast_agent.interfaces import AgentProtocol
+
 load_dotenv()
 
 console = Console()
 
 
+class FastAgentSession(Protocol):
+    """Typed view of the loaded fast-agent session used by upskill."""
+
+    skill_gen: AgentProtocol
+    test_gen: AgentProtocol
+    evaluator: LlmAgent
+
+
+EvalPlotLabelField = Literal["model", "skill_name"]
+
+
 @asynccontextmanager
-async def _fast_agent_context(config: Config | None = None) -> AsyncIterator[object]:
+async def _fast_agent_context(config: Config | None = None) -> AsyncIterator[FastAgentSession]:
     config = config or Config.load()
     fast = FastAgent(
         "upskill",
@@ -59,7 +77,7 @@ async def _fast_agent_context(config: Config | None = None) -> AsyncIterator[obj
     )
 
     @fast.agent()
-    async def empty():
+    async def empty() -> None:
         pass
 
     cards = resources.files("upskill").joinpath("agent_cards")
@@ -67,7 +85,7 @@ async def _fast_agent_context(config: Config | None = None) -> AsyncIterator[obj
         fast.load_agents(cards_path)
 
     async with fast.run() as agent:
-        yield agent
+        yield cast("FastAgentSession", agent)
 
 
 async def _set_agent_model(agent: object, model: str | None) -> None:
@@ -100,6 +118,13 @@ def _require_resolved_models(values: list[str], *, field: str, command: str) -> 
     return values
 
 
+def _require_path(value: Path | None, *, field: str, command: str) -> Path:
+    """Require a resolved filesystem path for logging flows."""
+    if value is None:
+        raise RuntimeError(f"Internal bug: `{command}` requires `{field}` to be set.")
+    return value
+
+
 def _print_model_plan(command: str, resolved: ResolvedModels, runs: int | None = None) -> None:
     """Print resolved model plan for command execution."""
     console.print("[dim]Resolved model plan:[/dim]")
@@ -117,12 +142,12 @@ def _print_model_plan(command: str, resolved: ResolvedModels, runs: int | None =
         console.print(f"  Evaluation Model(s): {models}")
         if runs is not None:
             console.print(f"  Runs per model: {runs}")
-        baseline_state = "off (benchmark mode)" if resolved.is_benchmark_mode else (
-            "on" if resolved.run_baseline else "off"
+        baseline_state = (
+            "off (benchmark mode)"
+            if resolved.is_benchmark_mode
+            else ("on" if resolved.run_baseline else "off")
         )
-        console.print(
-            f"  Baseline: {baseline_state}"
-        )
+        console.print(f"  Baseline: {baseline_state}")
         console.print(f"  Test Generation Model: {resolved.test_generation_model}")
 
 
@@ -131,7 +156,7 @@ def _render_bar(value: float, width: int = 20) -> str:
     if width <= 0:
         return ""
     clamped = max(0.0, min(1.0, value))
-    filled = int(round(clamped * width))
+    filled = round(clamped * width)
     empty = width - filled
     return "█" * filled + "░" * empty
 
@@ -263,7 +288,7 @@ def main():
 def generate(
     task: str,
     example: tuple[str, ...],
-    tool: str | None,  # noqa: ARG001
+    tool: str | None,
     from_source: str | None,
     model: str | None,
     test_gen_model: str | None,
@@ -303,6 +328,8 @@ def generate(
 
         upskill generate "document code" --no-log-runs
     """
+    del tool
+
     # Auto-detect if --from is a skill directory or trace file
     from_skill = None
     from_trace = None
@@ -330,7 +357,7 @@ def generate(
     )
 
 
-async def _generate_async(
+async def _generate_async(  # noqa: C901
     task: str,
     examples: list[str] | None,
     from_skill: str | None,
@@ -491,7 +518,10 @@ async def _generate_async(
                 run_results.append(baseline_result)
 
                 # Log with-skill result (in a separate folder)
-                with_skill_folder = create_run_folder(batch_folder, attempt * 2 + 2)
+                with_skill_folder = create_run_folder(
+                    _require_path(batch_folder, field="batch_folder", command="generate"),
+                    attempt * 2 + 2,
+                )
                 with_skill_result = RunResult(
                     metadata=RunMetadata(
                         model=skill_gen_model,
@@ -591,7 +621,10 @@ async def _generate_async(
                 run_results.append(baseline_result)
 
                 # Log with-skill result
-                with_skill_folder = create_run_folder(batch_folder, run_number + 1)
+                with_skill_folder = create_run_folder(
+                    _require_path(batch_folder, field="batch_folder", command="generate"),
+                    run_number + 1,
+                )
                 with_skill_result = RunResult(
                     metadata=RunMetadata(
                         model=extra_eval_model,
@@ -648,23 +681,17 @@ async def _generate_async(
         )
 
 
-
-
-
 def _save_and_display(
     skill: Skill,
     output: str | None,
     config: Config,
-    results=None,
-    eval_results=None,
+    results: EvalResults | None = None,
+    eval_results: EvalResults | None = None,
     skill_gen_model: str | None = None,
     eval_model: str | None = None,
 ):
     """Save skill and display summary."""
-    if output:
-        output_path = Path(output)
-    else:
-        output_path = config.skills_dir / skill.name
+    output_path = Path(output) if output else config.skills_dir / skill.name
 
     skill.save(output_path)
 
@@ -809,7 +836,7 @@ def eval_cmd(
     )
 
 
-async def _eval_async(
+async def _eval_async(  # noqa: C901
     skill_path: str,
     tests: str | None,
     models: list[str] | None,
@@ -886,9 +913,7 @@ async def _eval_async(
             expected_values = [value.strip() for value in tc.expected.contains if value.strip()]
             if len(expected_values) < 2:
                 invalid_expected += 1
-        console.print(
-            f"[dim]Loaded {len(test_cases)} test case(s) from {test_source}[/dim]"
-        )
+        console.print(f"[dim]Loaded {len(test_cases)} test case(s) from {test_source}[/dim]")
         if invalid_expected:
             console.print(
                 f"[yellow]{invalid_expected} test case(s) missing expected strings[/yellow]"
@@ -907,10 +932,7 @@ async def _eval_async(
             console.print(
                 f"\nEvaluating [bold]{skill.name}[/bold] across {len(evaluation_models)} model(s)"
             )
-            console.print(
-                f"  {len(test_cases)} test case(s), "
-                f"{num_runs} run(s) per model\n"
-            )
+            console.print(f"  {len(test_cases)} test case(s), {num_runs} run(s) per model\n")
 
             model_results: dict[str, list[RunResult]] = {m: [] for m in evaluation_models}
             all_run_results: list[RunResult] = []
@@ -921,9 +943,7 @@ async def _eval_async(
                 for run_num in range(1, num_runs + 1):
                     run_folder = None
                     if log_runs and batch_folder:
-                        run_folder = create_run_folder(
-                            batch_folder, len(all_run_results) + 1
-                        )
+                        run_folder = create_run_folder(batch_folder, len(all_run_results) + 1)
 
                     # Run each test case
                     total_assertions_passed = 0
@@ -944,9 +964,7 @@ async def _eval_async(
                                 evaluator=agent.evaluator,
                                 skill=skill,
                                 model=model,
-                                instance_name=(
-                                    f"eval ({model} run {run_num} test {tc_idx})"
-                                ),
+                                instance_name=(f"eval ({model} run {run_num} test {tc_idx})"),
                             )
                         except Exception as e:
                             console.print(f"  [red]Test error: {e}[/red]")
@@ -1126,7 +1144,8 @@ async def _eval_async(
             if verbose and resolved.run_baseline:
                 console.print()
                 for i, (with_r, base_r) in enumerate(
-                    zip(results.with_skill_results, results.baseline_results), 1
+                    zip(results.with_skill_results, results.baseline_results, strict=True),
+                    1,
                 ):
                     base_icon = "[green]OK[/green]" if base_r.success else "[red]FAIL[/red]"
                     skill_icon = "[green]OK[/green]" if with_r.success else "[red]FAIL[/red]"
@@ -1184,10 +1203,7 @@ async def _eval_async(
 def list_cmd(skills_dir: str | None, verbose: bool):
     """List generated skills."""
     config = Config.load()
-    if skills_dir:
-        path = Path(skills_dir)
-    else:
-        path = config.skills_dir
+    path = Path(skills_dir) if skills_dir else config.skills_dir
 
     if not path.exists():
         console.print(f"No skills directory found at {path}")
@@ -1312,7 +1328,7 @@ def benchmark_cmd(
     )
 
 
-async def _benchmark_async(
+async def _benchmark_async(  # noqa: C901
     skill_path: str,
     models: list[str],
     test_gen_model: str | None,
@@ -1368,10 +1384,7 @@ async def _benchmark_async(
             )
 
         # Setup output directory
-        if output_dir:
-            out_path = Path(output_dir)
-        else:
-            out_path = config.runs_dir
+        out_path = Path(output_dir) if output_dir else config.runs_dir
 
         batch_id, batch_folder = create_batch_folder(out_path)
         console.print(f"Results will be saved to: {batch_folder}", style="dim")
@@ -1407,9 +1420,7 @@ async def _benchmark_async(
                             evaluator=agent.evaluator,
                             skill=skill,
                             model=model,
-                            instance_name=(
-                                f"benchmark ({model} run {run_num} test {tc_idx})"
-                            ),
+                            instance_name=(f"benchmark ({model} run {run_num} test {tc_idx})"),
                         )
                     except Exception as e:
                         console.print(f"  [red]Test error: {e}[/red]")
@@ -1479,9 +1490,7 @@ async def _benchmark_async(
             avg_tokens = (
                 sum(r.stats.total_tokens for r in results) / total_runs if total_runs else 0
             )
-            avg_turns = (
-                sum(r.stats.turns for r in results) / total_runs if total_runs else 0
-            )
+            avg_turns = sum(r.stats.turns for r in results) / total_runs if total_runs else 0
 
             pass_rate = passed_runs / total_runs if total_runs else 0
             pass_rate_str = f"{pass_rate:.0%}"
@@ -1505,6 +1514,7 @@ async def _benchmark_async(
             results=all_run_results,
         )
         write_batch_summary(batch_folder, summary)
+
 
 @main.command("runs")
 @click.option("-d", "--dir", "runs_dir", type=click.Path(exists=True), help="Runs directory")
@@ -1582,13 +1592,13 @@ def runs_cmd(
         sys.exit(0)
 
     # Aggregate by model and skill (take most recent / highest)
-    aggregated: dict[tuple[str, str], dict] = {}
+    aggregated: dict[tuple[str, str], EvalPlotResult] = {}
     for r in all_results:
         key = (r["model"], r["skill_name"])
         if key not in aggregated or r["with_skill_rate"] > aggregated[key]["with_skill_rate"]:
             aggregated[key] = r
 
-    results_list = list(aggregated.values())
+    results_list: list[EvalPlotResult] = list(aggregated.values())
 
     # Determine display mode
     unique_skills = set(r["skill_name"] for r in results_list)
@@ -1598,7 +1608,7 @@ def runs_cmd(
 
     if len(unique_skills) == 1 and len(unique_models) >= 1:
         # Single skill, multiple models - use Panel
-        skill_name = list(unique_skills)[0]
+        skill_name = next(iter(unique_skills))
 
         # Build content for panel
         content_lines = []
@@ -1611,7 +1621,7 @@ def runs_cmd(
 
     elif len(unique_models) == 1 and len(unique_skills) >= 1:
         # Single model, multiple skills - use Panel
-        model_name = list(unique_models)[0]
+        model_name = next(iter(unique_models))
 
         content_lines = []
         for r in sorted(results_list, key=lambda x: x["skill_name"]):
@@ -1667,10 +1677,10 @@ def plot_cmd(
 def _format_comparison_bars(
     result: EvalPlotResult,
     metric: str,
-    label_field: str = "model",
+    label_field: EvalPlotLabelField = "model",
 ) -> str:
     """Format baseline vs with-skill comparison bars for a single result as string."""
-    label = result[label_field]
+    label = result["skill_name"] if label_field == "skill_name" else result["model"]
     has_baseline = result["has_baseline"]
     lines = [f"[bold]{label}[/bold]"]
 
@@ -1694,8 +1704,7 @@ def _format_comparison_bars(
             )
         else:
             lines.append(
-                "  with skill "
-                f"{with_skill_bar}  {with_skill_val:>5.0%}  [dim](no baseline)[/dim]"
+                f"  with skill {with_skill_bar}  {with_skill_val:>5.0%}  [dim](no baseline)[/dim]"
             )
     else:  # tokens
         with_skill_val = result["with_skill_tokens"]
@@ -1720,8 +1729,7 @@ def _format_comparison_bars(
         else:
             with_skill_bar = _render_bar(1.0 if with_skill_val > 0 else 0)
             lines.append(
-                "  with skill "
-                f"{with_skill_bar}  {with_skill_val:>6}  [dim](no baseline)[/dim]"
+                f"  with skill {with_skill_bar}  {with_skill_val:>6}  [dim](no baseline)[/dim]"
             )
 
     return "\n".join(lines)
@@ -1730,7 +1738,7 @@ def _format_comparison_bars(
 def _print_comparison_bars(
     result: EvalPlotResult,
     metric: str,
-    label_field: str = "model",
+    label_field: EvalPlotLabelField = "model",
 ) -> None:
     """Print baseline vs with-skill comparison bars for a single result."""
     console.print(_format_comparison_bars(result, metric, label_field))

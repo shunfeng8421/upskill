@@ -149,7 +149,7 @@ def test_resolve_unsupported_command_raises() -> None:
 
 
 def test_config_legacy_model_key_maps_to_skill_generation_model() -> None:
-    config = Config(model="haiku")
+    config = Config.model_validate({"model": "haiku"})
 
     assert config.skill_generation_model == "haiku"
     assert config.model == "haiku"

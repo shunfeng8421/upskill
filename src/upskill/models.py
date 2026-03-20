@@ -5,9 +5,12 @@ from __future__ import annotations
 import json
 import re
 from datetime import datetime
-from pathlib import Path
+from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 class SkillMetadata(BaseModel):
@@ -71,8 +74,6 @@ class TestCase(BaseModel):
     validator_config: dict[str, str | int | float | bool] | None = None
 
 
-
-
 class TestCaseSuite(BaseModel):
     """Structured container for a list of test cases."""
 
@@ -89,6 +90,106 @@ class SkillDraft(BaseModel):
     body: str
     references: dict[str, str] | None = None
     scripts: dict[str, str] | None = None
+
+
+def _parse_skill_frontmatter(
+    content: str,
+    *,
+    default_name: str,
+) -> tuple[str, str, list[str] | None, str | None, bool, bool, str]:
+    """Parse SKILL.md frontmatter and return normalized fields."""
+    name = default_name
+    description = ""
+    allowed_tools: list[str] | None = None
+    argument_hint: str | None = None
+    user_invocable = True
+    disable_model_invocation = False
+    body = content
+
+    if not content.startswith("---"):
+        return (
+            name,
+            description,
+            allowed_tools,
+            argument_hint,
+            user_invocable,
+            disable_model_invocation,
+            body,
+        )
+
+    parts = content.split("---", 2)
+    if len(parts) < 3:
+        return (
+            name,
+            description,
+            allowed_tools,
+            argument_hint,
+            user_invocable,
+            disable_model_invocation,
+            body,
+        )
+
+    frontmatter = parts[1].strip()
+    body = parts[2].strip()
+
+    for line in frontmatter.splitlines():
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        key = key.strip()
+        value = value.strip()
+
+        if key == "name":
+            name = value
+        elif key == "description":
+            description = value
+        elif key == "allowed-tools":
+            allowed_tools = [tool.strip() for tool in value.split(",")]
+        elif key == "argument-hint":
+            argument_hint = value
+        elif key == "user-invocable":
+            user_invocable = value.lower() != "false"
+        elif key == "disable-model-invocation":
+            disable_model_invocation = value.lower() == "true"
+
+    return (
+        name,
+        description,
+        allowed_tools,
+        argument_hint,
+        user_invocable,
+        disable_model_invocation,
+        body,
+    )
+
+
+def _load_skill_metadata_and_tests(path: Path) -> tuple[SkillMetadata, list[TestCase]]:
+    """Load optional upskill metadata stored alongside a skill."""
+    metadata = SkillMetadata()
+    tests: list[TestCase] = []
+    meta_path = path / "skill_meta.json"
+    if not meta_path.exists():
+        return metadata, tests
+
+    meta_dict = json.loads(meta_path.read_text())
+    if "metadata" in meta_dict:
+        metadata = SkillMetadata.model_validate(meta_dict["metadata"])
+    if "tests" in meta_dict:
+        tests = [TestCase.model_validate(test_case) for test_case in meta_dict["tests"]]
+    return metadata, tests
+
+
+def _load_artifact_directory(path: Path, directory_name: str) -> dict[str, str]:
+    """Load filename-to-content mappings from a skill artifact directory."""
+    directory = path / directory_name
+    if not directory.exists():
+        return {}
+
+    return {
+        file_path.name: file_path.read_text()
+        for file_path in directory.iterdir()
+        if file_path.is_file()
+    }
 
 
 class Skill(BaseModel):
@@ -163,9 +264,7 @@ class Skill(BaseModel):
             "metadata": self.metadata.model_dump(mode="json"),
             "tests": [t.model_dump(mode="json") for t in tests_to_save],
         }
-        (path / "skill_meta.json").write_text(
-            json.dumps(meta_dict, indent=2, default=str)
-        )
+        (path / "skill_meta.json").write_text(json.dumps(meta_dict, indent=2, default=str))
 
         # Write references
         if self.references:
@@ -196,67 +295,18 @@ class Skill(BaseModel):
             raise FileNotFoundError(f"SKILL.md not found in {path}")
 
         content = skill_md_path.read_text()
-
-        # Parse YAML frontmatter
-        name = path.name  # Default to directory name
-        description = ""
-        allowed_tools: list[str] | None = None
-        argument_hint: str | None = None
-        user_invocable = True
-        disable_model_invocation = False
-        body = content
-
-        if content.startswith("---"):
-            parts = content.split("---", 2)
-            if len(parts) >= 3:
-                frontmatter = parts[1].strip()
-                body = parts[2].strip()
-
-                for line in frontmatter.split("\n"):
-                    if ":" in line:
-                        key, value = line.split(":", 1)
-                        key = key.strip()
-                        value = value.strip()
-
-                        if key == "name":
-                            name = value
-                        elif key == "description":
-                            description = value
-                        elif key == "allowed-tools":
-                            allowed_tools = [t.strip() for t in value.split(",")]
-                        elif key == "argument-hint":
-                            argument_hint = value
-                        elif key == "user-invocable":
-                            user_invocable = value.lower() != "false"
-                        elif key == "disable-model-invocation":
-                            disable_model_invocation = value.lower() == "true"
-
-        # Load metadata and tests from skill_meta.json if present
-        metadata = SkillMetadata()
-        tests: list[TestCase] = []
-        meta_path = path / "skill_meta.json"
-        if meta_path.exists():
-            meta_dict = json.loads(meta_path.read_text())
-            if "metadata" in meta_dict:
-                metadata = SkillMetadata.model_validate(meta_dict["metadata"])
-            if "tests" in meta_dict:
-                tests = [TestCase.model_validate(t) for t in meta_dict["tests"]]
-
-        # Load references
-        references: dict[str, str] = {}
-        refs_dir = path / "references"
-        if refs_dir.exists():
-            for ref_file in refs_dir.iterdir():
-                if ref_file.is_file():
-                    references[ref_file.name] = ref_file.read_text()
-
-        # Load scripts
-        scripts: dict[str, str] = {}
-        scripts_dir = path / "scripts"
-        if scripts_dir.exists():
-            for script_file in scripts_dir.iterdir():
-                if script_file.is_file():
-                    scripts[script_file.name] = script_file.read_text()
+        (
+            name,
+            description,
+            allowed_tools,
+            argument_hint,
+            user_invocable,
+            disable_model_invocation,
+            body,
+        ) = _parse_skill_frontmatter(content, default_name=path.name)
+        metadata, tests = _load_skill_metadata_and_tests(path)
+        references = _load_artifact_directory(path, "references")
+        scripts = _load_artifact_directory(path, "scripts")
 
         return cls(
             name=name,
