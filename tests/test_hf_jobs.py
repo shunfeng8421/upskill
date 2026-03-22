@@ -1,22 +1,21 @@
 from __future__ import annotations
 
 import subprocess
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 import pytest
 
+import upskill.hf_jobs as hf_jobs
 from upskill.hf_jobs import (
     JobsConfig,
     SubmittedJob,
+    _make_run_id,
     _normalize_job_id,
-    _parse_submission_payload,
-    build_submit_eval_job_command,
+    _submit_bundle_job,
     parse_duration_seconds,
-    run_remote_eval,
-    submit_eval_job,
     wait_for_job_outputs,
 )
-from upskill.models import ExpectedSpec, Skill, TestCase
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -28,70 +27,23 @@ def test_parse_duration_seconds_supports_hf_style_suffixes() -> None:
     assert parse_duration_seconds("30") == 30.0
 
 
-def test_build_submit_eval_job_command_includes_noninteractive_flags(tmp_path: Path) -> None:
-    command = build_submit_eval_job_command(
-        skill_dir=tmp_path / "skill",
-        config=JobsConfig(
-            artifact_repo="namespace/upskill-evals",
-            wait=True,
-            jobs_timeout="45m",
-            jobs_flavor="cpu-basic",
-            jobs_secrets="HF_TOKEN,OPENROUTER_API_KEY",
-            jobs_namespace="my-org",
-        ),
-        models=["qwen35"],
-        runs=1,
-        no_baseline=True,
-        verbose=True,
-    )
-
-    assert "--artifact-repo" in command
-    assert "--skill-dir" in command
-    assert "--models" in command
-    assert "--no-baseline" in command
-    assert "--verbose" in command
-    assert "--yes" in command
-    assert "--json" in command
-    assert "--namespace" in command
-
-
-def test_submit_eval_job_parses_json_output(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+def test_make_run_id_adds_entropy_even_with_frozen_timestamp(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def fake_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
-        del args, kwargs
-        return subprocess.CompletedProcess(
-            args=[],
-            returncode=0,
-            stdout='{"job_id":"job-123","run_id":"run-456","artifact_repo":"ns/repo"}\n',
-            stderr="",
-        )
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz: object | None = None) -> FrozenDateTime:
+            del tz
+            return cls(2026, 3, 22, 12, 0, 0, tzinfo=UTC)
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr("upskill.hf_jobs.datetime", FrozenDateTime)
 
-    submission = submit_eval_job(
-        skill_dir=tmp_path / "skill",
-        config=JobsConfig(artifact_repo="ns/repo"),
-        models=["qwen35"],
-        runs=1,
-        no_baseline=False,
-        verbose=False,
-    )
+    run_id_a = _make_run_id("with-skill", "qwen35", "pull-request-descriptions")
+    run_id_b = _make_run_id("with-skill", "qwen35", "pull-request-descriptions")
 
-    assert submission.job_id == "job-123"
-    assert submission.run_id == "run-456"
-    assert submission.artifact_repo == "ns/repo"
-
-
-def test_parse_submission_payload_handles_preamble_lines() -> None:
-    payload = _parse_submission_payload(
-        "RUN_ID=abc123\n"
-        "Secrets to forward:\n"
-        "  - HF_TOKEN (present locally)\n"
-        '{"job_id":"job-123","run_id":"run-456","artifact_repo":"ns/repo"}\n'
-    )
-
-    assert payload["job_id"] == "job-123"
+    assert run_id_a != run_id_b
+    assert run_id_a.startswith("20260322T120000Z_with-skill-qwen35-pull-request-descriptions_")
+    assert run_id_b.startswith("20260322T120000Z_with-skill-qwen35-pull-request-descriptions_")
 
 
 def test_normalize_job_id_extracts_namespace_and_id_from_url() -> None:
@@ -172,67 +124,125 @@ def test_wait_for_job_outputs_raises_when_job_enters_error_stage(
         )
 
 
-def test_run_remote_eval_submits_with_skill_and_baseline_before_waiting(
+def test_submit_bundle_job_retries_conflict_upload_and_auth_rate_limit(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    events: list[str] = []
+    calls: list[list[str]] = []
+    bundle_archive = tmp_path / "bundle.tar.gz"
+    bundle_archive.write_text("bundle", encoding="utf-8")
 
-    skill = Skill(
-        name="pull-request-descriptions",
-        description="Write good pull request descriptions.",
-        body="Use a clear structure.",
-    )
-    test_cases = [TestCase(input="prompt", expected=ExpectedSpec(contains=["answer"]))]
+    def fake_run(
+        args: list[str],
+        **kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        del kwargs
+        calls.append(args)
+        if args[:2] == ["hf", "download"] and "--dry-run" in args:
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+        if args[:2] == ["hf", "upload"] and args[4].endswith("bundle.tar.gz"):
+            upload_attempt = sum(
+                1
+                for call in calls
+                if call[:2] == ["hf", "upload"] and call[4].endswith("bundle.tar.gz")
+            )
+            if upload_attempt == 1:
+                return subprocess.CompletedProcess(
+                    args=args,
+                    returncode=1,
+                    stdout="",
+                    stderr="412 Precondition Failed\nA commit has happened since. Please refresh and try again.\n",
+                )
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+        if args[:3] == ["hf", "jobs", "run"]:
+            submit_attempt = sum(1 for call in calls if call[:3] == ["hf", "jobs", "run"])
+            if submit_attempt == 1:
+                return subprocess.CompletedProcess(
+                    args=args,
+                    returncode=1,
+                    stdout="Set HF_DEBUG=1 as environment variable for full traceback.\n",
+                    stderr=(
+                        "Error: You've hit the rate limit for the /whoami-v2 endpoint, "
+                        "which is intentionally strict for security reasons.\n"
+                    ),
+                )
+            return subprocess.CompletedProcess(
+                args=args,
+                returncode=0,
+                stdout="View at: https://huggingface.co/jobs/evalstate/job-123\n",
+                stderr="",
+            )
+        return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
 
-    def fake_submit_fast_agent_eval_job(**kwargs: object) -> SubmittedJob:
-        phase_label = kwargs["phase_label"]
-        events.append(f"submit:{phase_label}")
-        return SubmittedJob(
-            job_id=f"evalstate/{phase_label}-job",
-            run_id=f"{phase_label}-run",
-            artifact_repo="ns/repo",
-        )
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr("upskill.hf_jobs.time.sleep", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("upskill.hf_jobs._VERIFIED_ARTIFACT_REPOS", set())
 
-    def fake_wait_for_job_outputs(
-        job: SubmittedJob,
-        *,
-        destination_root: Path,
-        wait_timeout_seconds: float,
-        progress_callback: object = None,
-    ) -> Path:
-        del wait_timeout_seconds, progress_callback
-        events.append(f"wait:{job.run_id}")
-        output_dir = destination_root / "outputs" / job.run_id
-        output_dir.mkdir(parents=True, exist_ok=True)
-        results_dir = output_dir / "results"
-        status_dir = output_dir / "status"
-        results_dir.mkdir()
-        status_dir.mkdir()
-        result_file = results_dir / "test_1.json"
-        result_file.write_text(
-            '{"messages":[{"role":"assistant","content":[{"type":"text","text":"answer"}]}]}',
-            encoding="utf-8",
-        )
-        (status_dir / "test_1.exit_code.txt").write_text("0\n", encoding="utf-8")
-        return output_dir
-
-    monkeypatch.setattr(
-        "upskill.hf_jobs.submit_fast_agent_eval_job", fake_submit_fast_agent_eval_job
-    )
-    monkeypatch.setattr("upskill.hf_jobs.wait_for_job_outputs", fake_wait_for_job_outputs)
-
-    results, job_refs = run_remote_eval(
-        skill=skill,
-        test_cases=test_cases,
+    submission = _submit_bundle_job(
+        bundle_archive=bundle_archive,
+        jobs_config=JobsConfig(artifact_repo="ns/repo"),
+        run_id="run-456",
         model="qwen35",
-        jobs_config=JobsConfig(artifact_repo="ns/repo", wait=True),
-        fastagent_config_path=tmp_path / "fastagent.config.yaml",
-        destination_root=tmp_path / "remote",
-        run_baseline=True,
     )
 
-    assert results is not None
-    assert job_refs == ["evalstate/with-skill-job", "evalstate/baseline-job"]
-    assert events[:2] == ["submit:with-skill", "submit:baseline"]
-    assert sorted(events[2:]) == ["wait:baseline-run", "wait:with-skill-run"]
+    assert submission == SubmittedJob(
+        job_id="evalstate/job-123",
+        run_id="run-456",
+        artifact_repo="ns/repo",
+    )
+    assert sum(1 for call in calls if call[:2] == ["hf", "download"] and "--dry-run" in call) == 1
+    assert sum(1 for call in calls if call[:2] == ["hf", "upload"]) == 2
+    assert sum(1 for call in calls if call[:3] == ["hf", "jobs", "run"]) == 2
+
+
+def test_submit_bundle_job_checks_artifact_repo_once_per_process(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    calls: list[list[str]] = []
+    bundle_archive = tmp_path / "bundle.tar.gz"
+    bundle_archive.write_text("bundle", encoding="utf-8")
+
+    def fake_run(
+        args: list[str],
+        **kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        del kwargs
+        calls.append(args)
+        if args[:2] == ["hf", "download"] and "--dry-run" in args:
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+        if args[:2] == ["hf", "upload"]:
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+        if args[:3] == ["hf", "jobs", "run"]:
+            run_number = sum(1 for call in calls if call[:3] == ["hf", "jobs", "run"])
+            return subprocess.CompletedProcess(
+                args=args,
+                returncode=0,
+                stdout=f"View at: https://huggingface.co/jobs/evalstate/job-{run_number}\n",
+                stderr="",
+            )
+        return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr("upskill.hf_jobs._VERIFIED_ARTIFACT_REPOS", set())
+
+    first = _submit_bundle_job(
+        bundle_archive=bundle_archive,
+        jobs_config=JobsConfig(artifact_repo="ns/repo"),
+        run_id="run-1",
+        model="qwen35",
+    )
+    second = _submit_bundle_job(
+        bundle_archive=bundle_archive,
+        jobs_config=JobsConfig(artifact_repo="ns/repo"),
+        run_id="run-2",
+        model="qwen35",
+    )
+
+    assert first.job_id == "evalstate/job-1"
+    assert second.job_id == "evalstate/job-2"
+    assert sum(1 for call in calls if call[:2] == ["hf", "download"] and "--dry-run" in call) == 1
+    assert {"ns/repo"} == hf_jobs._VERIFIED_ARTIFACT_REPOS
+    jobs_run_call = calls[-1]
+    assert "ghcr.io/astral-sh/uv:python3.13-bookworm" in jobs_run_call
+    assert any("huggingface_hub[cli]==1.7.2" in arg for arg in jobs_run_call)

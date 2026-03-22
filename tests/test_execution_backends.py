@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 
 import pytest
@@ -8,10 +9,13 @@ from fast_agent.mcp.prompt_message_extended import PromptMessageExtended
 from fast_agent.mcp.prompt_serialization import save_json
 from mcp.types import TextContent
 
+from upskill.artifacts import materialize_workspace
 from upskill.evaluate import evaluate_skill, load_eval_results_from_artifact_root
 from upskill.executors.contracts import ExecutionHandle, ExecutionRequest, ExecutionResult
 from upskill.executors.local_fast_agent import LocalFastAgentExecutor
+from upskill.executors.remote_fast_agent import RemoteFastAgentExecutor
 from upskill.fast_agent_cli import build_fast_agent_command
+from upskill.hf_jobs import JobsConfig, SubmittedJob
 from upskill.models import ConversationStats, ExpectedSpec, Skill, TestCase, TestResult
 from upskill.result_parsing import parse_fast_agent_results
 
@@ -58,12 +62,16 @@ def test_build_fast_agent_command_uses_explicit_contract(tmp_path: Path) -> None
     request = _build_request(tmp_path)
     command = build_fast_agent_command(
         request,
+        cards_dir=tmp_path / "bundle" / "cards",
         skills_dir=tmp_path / "bundle" / "skills",
         results_path=tmp_path / "bundle" / "results.json",
         fast_agent_bin="fast-agent",
     )
 
     assert command[:2] == ["fast-agent", "go"]
+    assert "--config-path" in command
+    assert "--card" in command
+    assert "--agent" in command
     assert "--model" in command
     assert "--skills-dir" in command
     assert "--results" in command
@@ -116,6 +124,7 @@ async def test_local_fast_agent_executor_preserves_artifacts_and_parses_results(
     assert (request.artifact_dir / "stderr.txt").exists()
     assert (request.artifact_dir / "workspace" / "context.txt").read_text() == "hello"
     assert (request.artifact_dir / "workspace" / "fastagent.config.yaml").exists()
+    assert (request.artifact_dir / "cards" / "evaluator.md").exists()
     assert (request.artifact_dir / "skills" / "write-good-prs" / "SKILL.md").exists()
 
 
@@ -144,6 +153,114 @@ async def test_local_fast_agent_executor_fails_when_results_artifact_is_missing(
 
     assert result.error == "fast-agent run did not produce a results artifact."
     assert result.raw_results_path is None
+
+
+@pytest.mark.asyncio
+async def test_remote_fast_agent_executor_preserves_artifacts_and_parses_results(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = _build_request(tmp_path)
+    executor = RemoteFastAgentExecutor(jobs_config=JobsConfig(artifact_repo="ns/repo"))
+
+    def fake_submit_bundle_job(**kwargs: object) -> SubmittedJob:
+        del kwargs
+        return SubmittedJob(
+            job_id="evalstate/job-123",
+            run_id="run-456",
+            artifact_repo="ns/repo",
+        )
+
+    def fake_wait_for_job_outputs(
+        job: SubmittedJob,
+        *,
+        destination_root: Path,
+        wait_timeout_seconds: float,
+        progress_callback: object = None,
+    ) -> Path:
+        del wait_timeout_seconds, progress_callback
+        output_dir = destination_root / "outputs" / job.run_id
+        (output_dir / "results").mkdir(parents=True, exist_ok=True)
+        (output_dir / "logs").mkdir(parents=True, exist_ok=True)
+        (output_dir / "status").mkdir(parents=True, exist_ok=True)
+        (output_dir / "workspaces" / "request_1").mkdir(parents=True, exist_ok=True)
+        _write_result_history(
+            output_dir / "results" / "request_1.json", assistant_text="Remote answer"
+        )
+        (output_dir / "logs" / "request_1.out.txt").write_text("stdout\n", encoding="utf-8")
+        (output_dir / "logs" / "request_1.err.txt").write_text("", encoding="utf-8")
+        (output_dir / "status" / "request_1.exit_code.txt").write_text("0\n", encoding="utf-8")
+        (output_dir / "workspaces" / "request_1" / "context.txt").write_text(
+            "remote hello",
+            encoding="utf-8",
+        )
+        return output_dir
+
+    monkeypatch.setattr(
+        "upskill.executors.remote_fast_agent._submit_bundle_job",
+        fake_submit_bundle_job,
+    )
+    monkeypatch.setattr(
+        "upskill.executors.remote_fast_agent.wait_for_job_outputs",
+        fake_wait_for_job_outputs,
+    )
+
+    handle = await executor.execute(request)
+    result = await executor.collect(handle)
+
+    assert result.error is None
+    assert result.output_text == "Remote answer"
+    assert result.raw_results_path == request.artifact_dir / "results.json"
+    assert result.metadata["job_id"] == "evalstate/job-123"
+    assert (request.artifact_dir / "stdout.txt").exists()
+    assert (request.artifact_dir / "stderr.txt").exists()
+    assert (request.artifact_dir / "remote_output" / "results" / "request_1.json").exists()
+    assert (request.artifact_dir / "workspace" / "context.txt").read_text() == "remote hello"
+
+
+@pytest.mark.asyncio
+async def test_remote_fast_agent_executor_submit_preserves_artifacts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = _build_request(tmp_path)
+    executor = RemoteFastAgentExecutor(jobs_config=JobsConfig(artifact_repo="ns/repo"))
+
+    def fake_submit_bundle_job(**kwargs: object) -> SubmittedJob:
+        del kwargs
+        return SubmittedJob(
+            job_id="evalstate/job-123",
+            run_id="run-456",
+            artifact_repo="ns/repo",
+        )
+
+    def fail_wait_for_job_outputs(*args: object, **kwargs: object) -> Path:
+        del args, kwargs
+        raise AssertionError("submit() should not wait for job outputs")
+
+    monkeypatch.setattr(
+        "upskill.executors.remote_fast_agent._submit_bundle_job",
+        fake_submit_bundle_job,
+    )
+    monkeypatch.setattr(
+        "upskill.executors.remote_fast_agent.wait_for_job_outputs",
+        fail_wait_for_job_outputs,
+    )
+
+    submission = await executor.submit(request)
+
+    assert submission == SubmittedJob(
+        job_id="evalstate/job-123",
+        run_id="run-456",
+        artifact_repo="ns/repo",
+    )
+    assert (request.artifact_dir / "request.json").exists()
+    assert (request.artifact_dir / "prompt.txt").exists()
+    assert (request.artifact_dir / "cards" / "evaluator.md").exists()
+    assert (request.artifact_dir / "skills" / "write-good-prs" / "SKILL.md").exists()
+    submitted_job = json.loads((request.artifact_dir / "submitted_job.json").read_text())
+    assert submitted_job["job_id"] == "evalstate/job-123"
+    assert submitted_job["run_id"] == "run-456"
 
 
 @pytest.mark.asyncio
@@ -182,8 +299,12 @@ async def test_local_fast_agent_executor_normalizes_paths_and_preserves_file_con
         assert cwd.is_absolute()
         results_index = args.index("--results") + 1
         prompt_index = args.index("--message") + 1
+        cards_index = args.index("--card") + 1
         skills_index = args.index("--skills-dir") + 1
-        for index in (results_index, prompt_index, skills_index):
+        config_index = args.index("--config-path") + 1
+        agent_index = args.index("--agent") + 1
+        assert args[agent_index] == "evaluator"
+        for index in (results_index, prompt_index, cards_index, skills_index, config_index):
             if index == prompt_index:
                 continue
             assert Path(args[index]).is_absolute()
@@ -198,6 +319,14 @@ async def test_local_fast_agent_executor_normalizes_paths_and_preserves_file_con
     result = await executor.collect(handle)
 
     assert result.error is None
+
+
+def test_materialize_workspace_rejects_paths_outside_workspace(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="must not traverse parents"):
+        materialize_workspace(tmp_path / "workspace", {"../pyproject.toml": "oops"})
+
+    with pytest.raises(ValueError, match="must be relative"):
+        materialize_workspace(tmp_path / "workspace", {"/tmp/pwned": "oops"})
 
 
 def test_load_eval_results_from_artifact_root_reconstructs_metrics(tmp_path: Path) -> None:

@@ -430,7 +430,7 @@ wheels = [
 
 [[package]]
 name = "fast-agent-mcp"
-version = "0.6.3"
+version = "0.6.7"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "a2a-sdk" },
@@ -465,9 +465,9 @@ dependencies = [
     { name = "uvloop", marker = "sys_platform != 'win32'" },
     { name = "watchfiles" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/54/0e/9acf0ce65573fcd7424a377c8963d7ba8bbf32bc63c114e4f335c0bfe6e7/fast_agent_mcp-0.6.3.tar.gz", hash = "sha256:eda002670ab337327f4f83fefd5721067c90af75d7df7af7dca4dd6bb161f34e", size = 1979633, upload-time = "2026-03-20T12:45:10.525Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/de/b4/abee6994b9d72a6b8763b0f1ac6273a54e6529e26277146df88d58366754/fast_agent_mcp-0.6.7.tar.gz", hash = "sha256:307148c04c3a8817a46e873137d7bd36f03feff53b90e3ec98c8798d6ccb49f8", size = 1992547, upload-time = "2026-03-22T20:50:48.563Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/cc/24/b958c80b92ab7455ad3499b18e86ae80da67fa9d1eab8ef315da24819e9a/fast_agent_mcp-0.6.3-py3-none-any.whl", hash = "sha256:e1765da264f9f09469f6ff02059d1d6505667232cfaef7dadd9653e4aeecaedc", size = 1451476, upload-time = "2026-03-20T12:45:15.018Z" },
+    { url = "https://files.pythonhosted.org/packages/2c/ea/a99a6859316172cbbb419ddc7923a450c7f36dd1f8a121d0bbc8e47932c9/fast_agent_mcp-0.6.7-py3-none-any.whl", hash = "sha256:c59ac2f24c677fa3966da0662b9387f64aaf491d76d617fb697563783ed239b3", size = 1461755, upload-time = "2026-03-22T20:50:46.885Z" },
 ]
 
 [[package]]
@@ -2009,7 +2009,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "click", specifier = ">=8.1" },
-    { name = "fast-agent-mcp", specifier = ">=0.6.3" },
+    { name = "fast-agent-mcp", specifier = ">=0.6.7" },
     { name = "pydantic", specifier = ">=2.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.23" },

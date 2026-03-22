@@ -2,23 +2,16 @@
 
 from __future__ import annotations
 
-import concurrent.futures
 import json
 import re
-import shutil
 import subprocess
-import tarfile
-import tempfile
+import threading
 import time
-from dataclasses import dataclass, replace
+import uuid
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
-
-from upskill.artifacts import copy_config_file, ensure_directory, materialize_workspace
-from upskill.evaluate import apply_eval_metrics, check_expected, format_test_prompt
-from upskill.models import EvalResults, Skill, TestCase, TestResult
-from upskill.result_parsing import parse_fast_agent_results
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -45,15 +38,20 @@ class SubmittedJob:
     artifact_repo: str
 
 
-@dataclass(frozen=True)
-class RemoteEvalJobResult:
-    """Downloaded artifact directory plus submitted job info."""
-
-    job: SubmittedJob
-    output_dir: Path
-
-
 _JOB_URL_RE = re.compile(r"https://huggingface\.co/jobs/(?P<namespace>[^/]+)/(?P<job_id>[^/\s]+)")
+_HF_UPLOAD_CONFLICT_MARKERS = (
+    "412 Precondition Failed",
+    "A commit has happened since. Please refresh and try again.",
+)
+_HF_AUTH_RATE_LIMIT_MARKERS = (
+    "rate limit for the /whoami-v2 endpoint",
+    "whoami-v2",
+)
+_HF_SUBMISSION_LOCK = threading.RLock()
+_VERIFIED_ARTIFACT_REPOS: set[str] = set()
+_HF_JOBS_IMAGE = "ghcr.io/astral-sh/uv:python3.13-bookworm"
+_HF_HUB_CLI_SPEC = "huggingface_hub[cli]==1.7.2"
+_FAST_AGENT_SPEC = "fast-agent-mcp==0.6.2"
 
 
 def _normalize_job_id(value: str) -> str:
@@ -73,22 +71,6 @@ def _split_job_reference(value: str) -> tuple[str | None, str]:
         namespace, job_id = normalized.rsplit("/", 1)
         return namespace, job_id
     return None, normalized
-
-
-def _parse_submission_payload(stdout: str) -> dict[str, object]:
-    """Parse the JSON payload from submission script output.
-
-    The wrapper scripts may print human-readable preamble lines before the final JSON line.
-    """
-    lines = [line.strip() for line in stdout.splitlines() if line.strip()]
-    for line in reversed(lines):
-        try:
-            payload = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(payload, dict):
-            return payload
-    raise RuntimeError(f"Unexpected HF eval submission output: {stdout}")
 
 
 def _lookup_job_stage(job_id: str) -> str | None:
@@ -131,6 +113,113 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
+def _is_retryable_hf_upload_failure(completed: subprocess.CompletedProcess[str]) -> bool:
+    """Return whether a failed ``hf upload`` can be retried safely."""
+    if completed.returncode == 0:
+        return False
+    output = f"{completed.stdout}\n{completed.stderr}"
+    return any(marker in output for marker in _HF_UPLOAD_CONFLICT_MARKERS)
+
+
+def _is_retryable_hf_auth_failure(completed: subprocess.CompletedProcess[str]) -> bool:
+    """Return whether a failed HF CLI call hit auth-related rate limiting."""
+    if completed.returncode == 0:
+        return False
+    output = f"{completed.stdout}\n{completed.stderr}"
+    return any(marker in output for marker in _HF_AUTH_RATE_LIMIT_MARKERS)
+
+
+def _run_hf_command_with_retry(
+    command: list[str],
+    *,
+    retryable: Callable[[subprocess.CompletedProcess[str]], bool],
+    attempts: int = 5,
+    initial_delay_seconds: float = 1.0,
+) -> subprocess.CompletedProcess[str]:
+    """Run an HF CLI command with retry/backoff for known transient failures."""
+    delay_seconds = initial_delay_seconds
+    last_completed: subprocess.CompletedProcess[str] | None = None
+
+    for attempt in range(1, attempts + 1):
+        completed = subprocess.run(
+            command,
+            cwd=_repo_root(),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        last_completed = completed
+        if completed.returncode == 0:
+            return completed
+        if attempt >= attempts or not retryable(completed):
+            return completed
+        time.sleep(delay_seconds)
+        delay_seconds *= 2
+
+    if last_completed is None:
+        raise RuntimeError("HF CLI retry loop completed without executing a command.")
+    return last_completed
+
+
+def _run_hf_upload_with_retry(
+    command: list[str],
+    *,
+    attempts: int = 5,
+    initial_delay_seconds: float = 1.0,
+) -> subprocess.CompletedProcess[str]:
+    """Run ``hf upload`` with retry/backoff for dataset branch conflicts."""
+    return _run_hf_command_with_retry(
+        command,
+        retryable=_is_retryable_hf_upload_failure,
+        attempts=attempts,
+        initial_delay_seconds=initial_delay_seconds,
+    )
+
+
+def _run_hf_auth_command_with_retry(
+    command: list[str],
+    *,
+    attempts: int = 5,
+    initial_delay_seconds: float = 1.0,
+) -> subprocess.CompletedProcess[str]:
+    """Run HF CLI commands that may transiently fail on auth endpoint rate limits."""
+    return _run_hf_command_with_retry(
+        command,
+        retryable=_is_retryable_hf_auth_failure,
+        attempts=attempts,
+        initial_delay_seconds=initial_delay_seconds,
+    )
+
+
+def _verify_artifact_repo_access(artifact_repo: str) -> None:
+    """Verify that the configured artifact dataset repo exists and is accessible."""
+    with _HF_SUBMISSION_LOCK:
+        if artifact_repo in _VERIFIED_ARTIFACT_REPOS:
+            return
+
+        completed = _run_hf_auth_command_with_retry(
+            [
+                "hf",
+                "download",
+                artifact_repo,
+                "--repo-type",
+                "dataset",
+                "--dry-run",
+                "--quiet",
+            ]
+        )
+        if completed.returncode != 0:
+            raise RuntimeError(
+                "Artifact repo is not accessible. Create it before submitting jobs and "
+                "ensure the current Hugging Face credentials can access it:\n"
+                f"repo: {artifact_repo}\n"
+                f"stdout:\n{completed.stdout}\n"
+                f"stderr:\n{completed.stderr}"
+            )
+
+        _VERIFIED_ARTIFACT_REPOS.add(artifact_repo)
+
+
 def parse_duration_seconds(value: str) -> float:
     """Parse a simple HF-style duration like ``45m`` or ``2h``."""
     if not value:
@@ -162,89 +251,9 @@ def _sanitize_label(value: str) -> str:
 def _make_run_id(*parts: str) -> str:
     timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     suffix = "-".join(_sanitize_label(part) for part in parts if part)
-    return f"{timestamp}_{suffix}" if suffix else timestamp
-
-
-def build_submit_eval_job_command(
-    *,
-    skill_dir: Path,
-    config: JobsConfig,
-    models: list[str],
-    runs: int,
-    no_baseline: bool,
-    verbose: bool,
-    tests_path: Path | None = None,
-) -> list[str]:
-    """Build the repository wrapper command for submitting a remote eval job."""
-    command = [
-        str(_repo_root() / "scripts" / "hf" / "submit_hf_eval_job.sh"),
-        "--artifact-repo",
-        config.artifact_repo,
-        "--skill-dir",
-        str(skill_dir),
-        "--models",
-        ",".join(models),
-        "--runs",
-        str(runs),
-        "--flavor",
-        config.jobs_flavor,
-        "--timeout",
-        config.jobs_timeout,
-        "--secrets",
-        config.jobs_secrets,
-        "--yes",
-        "--json",
-    ]
-    if tests_path is not None:
-        command.extend(["--tests", str(tests_path)])
-    if no_baseline:
-        command.append("--no-baseline")
-    if verbose:
-        command.append("--verbose")
-    if config.jobs_namespace:
-        command.extend(["--namespace", config.jobs_namespace])
-    return command
-
-
-def submit_eval_job(
-    *,
-    skill_dir: Path,
-    config: JobsConfig,
-    models: list[str],
-    runs: int,
-    no_baseline: bool,
-    verbose: bool,
-    tests_path: Path | None = None,
-) -> SubmittedJob:
-    """Submit an eval job via the checked-in HF wrapper script."""
-    command = build_submit_eval_job_command(
-        skill_dir=skill_dir,
-        config=config,
-        models=models,
-        runs=runs,
-        no_baseline=no_baseline,
-        verbose=verbose,
-        tests_path=tests_path,
-    )
-    completed = subprocess.run(
-        command,
-        cwd=_repo_root(),
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    if completed.returncode != 0:
-        raise RuntimeError(
-            "Failed to submit HF eval job:\n"
-            f"stdout:\n{completed.stdout}\n"
-            f"stderr:\n{completed.stderr}"
-        )
-    payload = _parse_submission_payload(completed.stdout)
-    return SubmittedJob(
-        job_id=_normalize_job_id(str(payload["job_id"])),
-        run_id=str(payload["run_id"]),
-        artifact_repo=str(payload["artifact_repo"]),
-    )
+    entropy = uuid.uuid4().hex[:8]
+    prefix = f"{timestamp}_{suffix}" if suffix else timestamp
+    return f"{prefix}_{entropy}"
 
 
 def wait_for_job_outputs(
@@ -336,80 +345,6 @@ def _hf_secret_flags(secrets: str) -> list[str]:
     return flags
 
 
-def _copy_request_bundle(
-    *,
-    bundle_root: Path,
-    test_cases: list[TestCase],
-    fastagent_config_path: Path,
-    skill: Skill | None,
-) -> None:
-    """Materialize a remote fast-agent batch bundle."""
-    ensure_directory(bundle_root)
-    skills_dir = ensure_directory(bundle_root / "skills")
-    if skill is not None:
-        skill.save(skills_dir / skill.name, tests=test_cases)
-    copy_config_file(fastagent_config_path.resolve(), bundle_root / "fastagent.config.yaml")
-
-    requests_root = ensure_directory(bundle_root / "requests")
-    manifest_requests: list[dict[str, object]] = []
-    for index, test_case in enumerate(test_cases, start=1):
-        request_id = f"test_{index}"
-        request_dir = ensure_directory(requests_root / request_id)
-        prompt_path = request_dir / "prompt.txt"
-        prompt_path.write_text(format_test_prompt(test_case), encoding="utf-8")
-        workspace_dir = ensure_directory(request_dir / "workspace")
-        workspace_files = (
-            dict(test_case.context.files) if test_case.context and test_case.context.files else {}
-        )
-        materialize_workspace(workspace_dir, workspace_files)
-        shell_enabled = bool(workspace_files or test_case.validator or test_case.output_file)
-        (request_dir / "enable_shell.txt").write_text(
-            "1" if shell_enabled else "0", encoding="utf-8"
-        )
-        manifest_requests.append(
-            {
-                "id": request_id,
-                "index": index,
-                "has_workspace_files": bool(workspace_files),
-                "enable_shell": shell_enabled,
-            }
-        )
-
-    (bundle_root / "manifest.json").write_text(
-        json.dumps(
-            {
-                "request_count": len(test_cases),
-                "requests": manifest_requests,
-            },
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
-
-
-def _create_bundle_archive(
-    *,
-    skill: Skill | None,
-    test_cases: list[TestCase],
-    fastagent_config_path: Path,
-) -> tuple[Path, Path]:
-    """Create a tar.gz bundle for remote fast-agent evaluation."""
-    temp_root = Path(tempfile.mkdtemp(prefix="upskill_hf_eval_"))
-    bundle_root = temp_root / "bundle"
-    _copy_request_bundle(
-        bundle_root=bundle_root,
-        test_cases=test_cases,
-        fastagent_config_path=fastagent_config_path,
-        skill=skill,
-    )
-    entrypoint_source = _repo_root() / "scripts" / "hf" / "job_entrypoint_eval_fast_agent.sh"
-    shutil.copy2(entrypoint_source, bundle_root / "job_entrypoint.sh")
-    bundle_archive = temp_root / "bundle.tar.gz"
-    with tarfile.open(bundle_archive, "w:gz") as archive:
-        archive.add(bundle_root, arcname="bundle")
-    return temp_root, bundle_archive
-
-
 def _submit_bundle_job(
     *,
     bundle_archive: Path,
@@ -417,43 +352,68 @@ def _submit_bundle_job(
     run_id: str,
     model: str,
 ) -> SubmittedJob:
-    subprocess.run(
-        ["hf", "repo", "create", jobs_config.artifact_repo, "--repo-type", "dataset", "--exist-ok"],
-        cwd=_repo_root(),
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    upload = subprocess.run(
-        [
-            "hf",
-            "upload",
-            jobs_config.artifact_repo,
-            str(bundle_archive),
-            f"inputs/{run_id}/bundle.tar.gz",
-            "--repo-type",
-            "dataset",
-            "--commit-message",
-            f"inputs: {run_id}",
-        ],
-        cwd=_repo_root(),
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+    _verify_artifact_repo_access(jobs_config.artifact_repo)
+    with _HF_SUBMISSION_LOCK:
+        upload = _run_hf_upload_with_retry(
+            [
+                "hf",
+                "upload",
+                jobs_config.artifact_repo,
+                str(bundle_archive),
+                f"inputs/{run_id}/bundle.tar.gz",
+                "--repo-type",
+                "dataset",
+                "--commit-message",
+                f"inputs: {run_id}",
+            ]
+        )
     if upload.returncode != 0:
         raise RuntimeError(
-            "Failed to upload remote eval bundle:\n"
+            "Failed to upload remote fast-agent bundle:\n"
             f"stdout:\n{upload.stdout}\n"
             f"stderr:\n{upload.stderr}"
         )
 
     job_cmd = (
         "set -euo pipefail\n"
+        "upload_with_retries() {\n"
+        '  local repo="$1"\n'
+        '  local src="$2"\n'
+        '  local dest="$3"\n'
+        '  local message="$4"\n'
+        "  local delay=1\n"
+        "  local attempt\n"
+        "  for attempt in 1 2 3 4 5; do\n"
+        '    local log_file="$(mktemp)"\n'
+        '    if hf upload "$repo" "$src" "$dest" --repo-type dataset --commit-message "$message" >"$log_file" 2>&1; then\n'
+        '      cat "$log_file"\n'
+        '      rm -f "$log_file"\n'
+        "      return 0\n"
+        "    fi\n"
+        '    if grep -q "412 Precondition Failed" "$log_file" && [[ "$attempt" -lt 5 ]]; then\n'
+        '      cat "$log_file" >&2\n'
+        '      rm -f "$log_file"\n'
+        '      sleep "$delay"\n'
+        "      delay=$((delay * 2))\n"
+        "      continue\n"
+        "    fi\n"
+        '    if grep -q "A commit has happened since" "$log_file" && [[ "$attempt" -lt 5 ]]; then\n'
+        '      cat "$log_file" >&2\n'
+        '      rm -f "$log_file"\n'
+        '      sleep "$delay"\n'
+        "      delay=$((delay * 2))\n"
+        "      continue\n"
+        "    fi\n"
+        '    cat "$log_file" >&2\n'
+        '    rm -f "$log_file"\n'
+        "    return 1\n"
+        "  done\n"
+        "  return 1\n"
+        "}\n"
         "WORK=/workspace\n"
         'mkdir -p "$WORK/out"\n'
         'cd "$WORK"\n'
-        'uv pip install --system "huggingface_hub[cli]>=1.0" "fast-agent-mcp==0.6.2"\n'
+        f'uv pip install --system "{_HF_HUB_CLI_SPEC}" "{_FAST_AGENT_SPEC}"\n'
         'hf download "$ARTIFACT_REPO" "inputs/$RUN_ID/bundle.tar.gz" --repo-type dataset --local-dir "$WORK"\n'
         'tar -xzf "$WORK/inputs/$RUN_ID/bundle.tar.gz" -C "$WORK"\n'
         "set +e\n"
@@ -461,8 +421,8 @@ def _submit_bundle_job(
         "status=$?\n"
         "set -e\n"
         'echo "$status" > "$WORK/out/exit_code.txt"\n'
-        'hf upload "$ARTIFACT_REPO" "$WORK/out" "outputs/$RUN_ID" --repo-type dataset '
-        '--commit-message "outputs: $RUN_ID (exit=$status)"\n'
+        'upload_with_retries "$ARTIFACT_REPO" "$WORK/out" "outputs/$RUN_ID" '
+        '"outputs: $RUN_ID (exit=$status)"\n'
         'exit "$status"\n'
     )
     command = [
@@ -487,213 +447,19 @@ def _submit_bundle_job(
     command.extend(
         [
             "--",
-            "ghcr.io/astral-sh/uv:python3.13-bookworm",
+            _HF_JOBS_IMAGE,
             "bash",
             "-lc",
             job_cmd,
         ]
     )
-    completed = subprocess.run(
-        command,
-        cwd=_repo_root(),
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+    with _HF_SUBMISSION_LOCK:
+        completed = _run_hf_auth_command_with_retry(command)
     if completed.returncode != 0:
         raise RuntimeError(
-            "Failed to submit remote fast-agent eval job:\n"
+            "Failed to submit remote fast-agent job:\n"
             f"stdout:\n{completed.stdout}\n"
             f"stderr:\n{completed.stderr}"
         )
     job_ref = _normalize_job_id(completed.stdout.strip().splitlines()[-1])
     return SubmittedJob(job_id=job_ref, run_id=run_id, artifact_repo=jobs_config.artifact_repo)
-
-
-def submit_fast_agent_eval_job(
-    *,
-    skill: Skill | None,
-    test_cases: list[TestCase],
-    fastagent_config_path: Path,
-    model: str,
-    jobs_config: JobsConfig,
-    destination_root: Path,
-    phase_label: str,
-    progress_callback: Callable[[str], None] | None = None,
-) -> RemoteEvalJobResult | SubmittedJob:
-    """Submit a remote fast-agent evaluation batch and optionally collect artifacts."""
-    temp_root, bundle_archive = _create_bundle_archive(
-        skill=skill,
-        test_cases=test_cases,
-        fastagent_config_path=fastagent_config_path,
-    )
-    try:
-        run_id = _make_run_id(phase_label, model, skill.name if skill else "baseline")
-        submission = _submit_bundle_job(
-            bundle_archive=bundle_archive,
-            jobs_config=jobs_config,
-            run_id=run_id,
-            model=model,
-        )
-    finally:
-        shutil.rmtree(temp_root, ignore_errors=True)
-
-    if progress_callback is not None:
-        progress_callback(
-            f"submitted remote {phase_label} batch as job {submission.job_id} (run_id={submission.run_id})"
-        )
-
-    if not jobs_config.wait:
-        return submission
-
-    output_dir = wait_for_job_outputs(
-        submission,
-        destination_root=destination_root,
-        wait_timeout_seconds=parse_duration_seconds(jobs_config.jobs_timeout),
-        progress_callback=progress_callback,
-    )
-    return RemoteEvalJobResult(job=submission, output_dir=output_dir)
-
-
-def reconstruct_remote_eval_results(
-    *,
-    output_dir: Path,
-    test_cases: list[TestCase],
-) -> list[TestResult]:
-    """Reconstruct per-test results from a downloaded remote fast-agent batch."""
-    results: list[TestResult] = []
-    for index, test_case in enumerate(test_cases, start=1):
-        request_id = f"test_{index}"
-        request_output_dir = output_dir
-        results_path = request_output_dir / "results" / f"{request_id}.json"
-        workspace_dir = request_output_dir / "workspaces" / request_id
-        status_path = request_output_dir / "status" / f"{request_id}.exit_code.txt"
-        exit_code = status_path.read_text(encoding="utf-8").strip() if status_path.exists() else ""
-
-        if not results_path.exists():
-            error = "fast-agent run did not produce a results artifact."
-            if exit_code and exit_code != "0":
-                error = f"{error} Exit code: {exit_code}."
-            results.append(TestResult(test_case=test_case, success=False, error=error))
-            continue
-
-        try:
-            parsed = parse_fast_agent_results(results_path)
-        except Exception as exc:
-            results.append(TestResult(test_case=test_case, success=False, error=str(exc)))
-            continue
-
-        if exit_code and exit_code != "0":
-            results.append(
-                TestResult(
-                    test_case=test_case,
-                    success=False,
-                    output=parsed.output_text,
-                    error=f"fast-agent exited with code {exit_code}.",
-                    stats=parsed.stats,
-                    tokens_used=parsed.stats.total_tokens,
-                    turns=parsed.stats.turns,
-                )
-            )
-            continue
-
-        success, validation_result = check_expected(
-            parsed.output_text or "",
-            test_case.expected,
-            workspace_dir if workspace_dir.exists() else None,
-            test_case,
-        )
-        results.append(
-            TestResult(
-                test_case=test_case,
-                success=success,
-                output=parsed.output_text,
-                tokens_used=parsed.stats.total_tokens,
-                turns=parsed.stats.turns,
-                stats=parsed.stats,
-                validation_result=validation_result,
-            )
-        )
-    return results
-
-
-def run_remote_eval(
-    *,
-    skill: Skill,
-    test_cases: list[TestCase],
-    model: str,
-    jobs_config: JobsConfig,
-    fastagent_config_path: Path,
-    destination_root: Path,
-    run_baseline: bool,
-    progress_callback: Callable[[str], None] | None = None,
-) -> tuple[EvalResults | None, list[str]]:
-    """Run remote fast-agent batches and reconstruct ``EvalResults`` locally."""
-    job_refs: list[str] = []
-    submission_config = replace(jobs_config, wait=False)
-    timeout_seconds = parse_duration_seconds(jobs_config.jobs_timeout)
-
-    with_skill_submission = submit_fast_agent_eval_job(
-        skill=skill,
-        test_cases=test_cases,
-        fastagent_config_path=fastagent_config_path,
-        model=model,
-        jobs_config=submission_config,
-        destination_root=destination_root / "with-skill",
-        phase_label="with-skill",
-        progress_callback=progress_callback,
-    )
-    assert isinstance(with_skill_submission, SubmittedJob)
-    job_refs.append(with_skill_submission.job_id)
-
-    jobs_to_collect: list[tuple[str, SubmittedJob, Path]] = [
-        ("with-skill", with_skill_submission, destination_root / "with-skill")
-    ]
-
-    if run_baseline:
-        baseline_submission = submit_fast_agent_eval_job(
-            skill=None,
-            test_cases=test_cases,
-            fastagent_config_path=fastagent_config_path,
-            model=model,
-            jobs_config=submission_config,
-            destination_root=destination_root / "baseline",
-            phase_label="baseline",
-            progress_callback=progress_callback,
-        )
-        assert isinstance(baseline_submission, SubmittedJob)
-        job_refs.append(baseline_submission.job_id)
-        jobs_to_collect.append(("baseline", baseline_submission, destination_root / "baseline"))
-
-    if not jobs_config.wait:
-        return None, job_refs
-
-    collected_outputs: dict[str, Path] = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(jobs_to_collect)) as executor:
-        future_map = {
-            executor.submit(
-                wait_for_job_outputs,
-                submission,
-                destination_root=collect_root,
-                wait_timeout_seconds=timeout_seconds,
-                progress_callback=progress_callback,
-            ): label
-            for label, submission, collect_root in jobs_to_collect
-        }
-        for future in concurrent.futures.as_completed(future_map):
-            label = future_map[future]
-            collected_outputs[label] = future.result()
-
-    results = EvalResults(skill_name=skill.name, model=model)
-    results.with_skill_results = reconstruct_remote_eval_results(
-        output_dir=collected_outputs["with-skill"],
-        test_cases=test_cases,
-    )
-
-    if run_baseline:
-        results.baseline_results = reconstruct_remote_eval_results(
-            output_dir=collected_outputs["baseline"],
-            test_cases=test_cases,
-        )
-
-    return apply_eval_metrics(results, test_cases), job_refs

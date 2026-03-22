@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+readonly DEFAULT_IMAGE="ghcr.io/astral-sh/uv:python3.13-bookworm"
+
 usage() {
   cat <<'USAGE'
 Usage:
-  submit_hf_fast_agent_job.sh \
+  submit_hf_job.sh \
     --artifact-repo <namespace/repo> \
     --skills-dir <path> \
     [--card-dir <path>] \
@@ -13,7 +15,7 @@ Usage:
     [--message <text> | --prompt-file <path> | --prompts-jsonl <path>] \
     [--flavor cpu-basic] \
     [--timeout 45m] \
-    [--image python:3.13-slim-bookworm] \
+    [--image ghcr.io/astral-sh/uv:python3.13-bookworm] \
     [--secrets HF_TOKEN,OPENAI_API_KEY] \
     [--namespace my-org] \
     [--yes] \
@@ -26,6 +28,82 @@ Notes:
 USAGE
 }
 
+fail() {
+  echo "$*" >&2
+  exit 1
+}
+
+trim() {
+  xargs <<<"$1"
+}
+
+prepare_secret_flags() {
+  IFS=',' read -r -a secret_keys <<< "$SECRETS"
+  secret_flags=()
+  echo "Secrets to forward:"
+  for raw_key in "${secret_keys[@]}"; do
+    key="$(trim "$raw_key")"
+    [[ -n "$key" ]] || continue
+    if [[ -n "${!key:-}" ]]; then
+      echo "  - $key (present locally)"
+    else
+      echo "  - $key (NOT set locally)"
+    fi
+    secret_flags+=(--secrets "$key")
+  done
+}
+
+check_artifact_repo() {
+  hf download "$ARTIFACT_REPO" --repo-type dataset --dry-run --quiet >/dev/null || \
+    fail "Artifact repo $ARTIFACT_REPO is not accessible. Create it first and ensure your current Hugging Face credentials can access it."
+}
+
+submit_bundle_job() {
+  check_artifact_repo
+
+  tar -czf "$tmpdir/bundle.tar.gz" -C "$tmpdir" bundle
+  hf upload "$ARTIFACT_REPO" "$tmpdir/bundle.tar.gz" "inputs/$RUN_ID/bundle.tar.gz" \
+    --repo-type dataset \
+    --commit-message "inputs: $RUN_ID" >/dev/null
+
+  prepare_secret_flags
+
+  if [[ "$AUTO_CONFIRM" != "1" ]]; then
+    read -r -p "Proceed with HF Job submission? [y/N] " confirm
+    [[ "$confirm" =~ ^[Yy]$ ]] || fail "Cancelled."
+  fi
+
+  ns_flags=()
+  if [[ -n "$NAMESPACE" ]]; then
+    ns_flags+=(--namespace "$NAMESPACE")
+  fi
+
+  job_id="$(
+    hf jobs run \
+      --detach \
+      --flavor "$FLAVOR" \
+      --timeout "$TIMEOUT" \
+      "${ns_flags[@]}" \
+      "${secret_flags[@]}" \
+      "${env_flags[@]}" \
+      -- \
+      "$IMAGE" \
+      bash -lc "$job_cmd"
+  )"
+
+  job_id="$(echo "$job_id" | tail -n 1 | xargs)"
+
+  if [[ "$JSON_OUTPUT" == "1" ]]; then
+    cat <<JSON
+{"job_id":"$job_id","run_id":"$RUN_ID","artifact_repo":"$ARTIFACT_REPO"}
+JSON
+  else
+    echo "JOB_ID=$job_id"
+    echo "RUN_ID=$RUN_ID"
+    echo "ARTIFACT_REPO=$ARTIFACT_REPO"
+  fi
+}
+
 ARTIFACT_REPO=""
 SKILLS_DIR=""
 CARD_DIR=""
@@ -36,12 +114,17 @@ PROMPT_FILE=""
 PROMPTS_JSONL=""
 FLAVOR="cpu-basic"
 TIMEOUT="45m"
-IMAGE="python:3.13-slim-bookworm"
+IMAGE="$DEFAULT_IMAGE"
 SECRETS="HF_TOKEN"
 NAMESPACE=""
 RUN_ID=""
 AUTO_CONFIRM="0"
 JSON_OUTPUT="0"
+tmpdir=""
+job_cmd=""
+secret_flags=()
+env_flags=()
+ns_flags=()
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -61,43 +144,37 @@ while [[ $# -gt 0 ]]; do
     --yes) AUTO_CONFIRM="1"; shift 1 ;;
     --json) JSON_OUTPUT="1"; shift 1 ;;
     -h|--help) usage; exit 0 ;;
-    *) echo "Unknown arg: $1" >&2; usage; exit 1 ;;
+    *) fail "Unknown arg: $1" ;;
   esac
 done
 
-[[ -n "$ARTIFACT_REPO" && -n "$SKILLS_DIR" ]] || { usage; exit 1; }
-[[ -d "$SKILLS_DIR" ]] || { echo "Skills dir not found: $SKILLS_DIR" >&2; exit 1; }
-
-input_modes=0
-[[ -n "$MESSAGE" ]] && input_modes=$((input_modes+1))
-[[ -n "$PROMPT_FILE" ]] && input_modes=$((input_modes+1))
-[[ -n "$PROMPTS_JSONL" ]] && input_modes=$((input_modes+1))
-[[ "$input_modes" -eq 1 ]] || {
-  echo "Provide exactly one of --message, --prompt-file, or --prompts-jsonl" >&2
+[[ -n "$ARTIFACT_REPO" && -n "$SKILLS_DIR" ]] || {
+  usage
   exit 1
 }
+[[ -d "$SKILLS_DIR" ]] || fail "Skills dir not found: $SKILLS_DIR"
+
+input_modes=0
+[[ -n "$MESSAGE" ]] && input_modes=$((input_modes + 1))
+[[ -n "$PROMPT_FILE" ]] && input_modes=$((input_modes + 1))
+[[ -n "$PROMPTS_JSONL" ]] && input_modes=$((input_modes + 1))
+[[ "$input_modes" -eq 1 ]] || fail "Provide exactly one of --message, --prompt-file, or --prompts-jsonl"
 
 if [[ -n "$PROMPT_FILE" && ! -f "$PROMPT_FILE" ]]; then
-  echo "Prompt file not found: $PROMPT_FILE" >&2
-  exit 1
+  fail "Prompt file not found: $PROMPT_FILE"
 fi
 if [[ -n "$PROMPTS_JSONL" && ! -f "$PROMPTS_JSONL" ]]; then
-  echo "Prompts JSONL not found: $PROMPTS_JSONL" >&2
-  exit 1
+  fail "Prompts JSONL not found: $PROMPTS_JSONL"
 fi
 if [[ -n "$CARD_DIR" && ! -d "$CARD_DIR" ]]; then
-  echo "Card dir not found: $CARD_DIR" >&2
-  exit 1
+  fail "Card dir not found: $CARD_DIR"
 fi
 if [[ -n "$AGENT" && -z "$CARD_DIR" ]]; then
-  echo "--agent requires --card-dir" >&2
-  exit 1
+  fail "--agent requires --card-dir"
 fi
 
 RUN_ID="${RUN_ID:-$(date -u +'%Y%m%dT%H%M%SZ')_fast-agent}"
 echo "RUN_ID=$RUN_ID"
-
-hf repo create "$ARTIFACT_REPO" --repo-type dataset --exist-ok >/dev/null
 
 tmpdir="$(mktemp -d)"
 trap 'rm -rf "$tmpdir"' EXIT
@@ -121,6 +198,13 @@ if [[ -f "fastagent.config.yaml" ]]; then
   cp "fastagent.config.yaml" "$bundle_dir/fastagent.config.yaml"
 fi
 
+mode_name="prompts-jsonl"
+if [[ -n "$MESSAGE" ]]; then
+  mode_name="message"
+elif [[ -n "$PROMPT_FILE" ]]; then
+  mode_name="prompt-file"
+fi
+
 cat > "$bundle_dir/manifest.json" <<JSON
 {
   "run_id": "$RUN_ID",
@@ -129,35 +213,10 @@ cat > "$bundle_dir/manifest.json" <<JSON
   "card_dir": "$CARD_DIR",
   "agent": "$AGENT",
   "model": "$MODEL",
-  "mode": "$( [[ -n "$MESSAGE" ]] && echo message || ([[ -n "$PROMPT_FILE" ]] && echo prompt-file || echo prompts-jsonl) )",
+  "mode": "$mode_name",
   "created_at_utc": "$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
 }
 JSON
-
-tar -czf "$tmpdir/bundle.tar.gz" -C "$tmpdir" bundle
-
-hf upload "$ARTIFACT_REPO" "$tmpdir/bundle.tar.gz" "inputs/$RUN_ID/bundle.tar.gz" \
-  --repo-type dataset \
-  --commit-message "inputs: $RUN_ID" >/dev/null
-
-IFS=',' read -r -a secret_keys <<< "$SECRETS"
-secret_flags=()
-echo "Secrets to forward:"
-for k in "${secret_keys[@]}"; do
-  key="$(echo "$k" | xargs)"
-  [[ -n "$key" ]] || continue
-  if [[ -n "${!key:-}" ]]; then
-    echo "  - $key (present locally)"
-  else
-    echo "  - $key (NOT set locally)"
-  fi
-  secret_flags+=(--secrets "$key")
-done
-
-if [[ "$AUTO_CONFIRM" != "1" ]]; then
-  read -r -p "Proceed with HF Job submission? [y/N] " confirm
-  [[ "$confirm" =~ ^[Yy]$ ]] || { echo "Cancelled."; exit 1; }
-fi
 
 job_cmd='
 set -euo pipefail
@@ -165,8 +224,7 @@ WORK=/workspace
 mkdir -p "$WORK/out"
 cd "$WORK"
 
-python -m pip install --upgrade pip
-python -m pip install "huggingface_hub[cli]>=1.0" "fast-agent-mcp==0.6.2"
+uv pip install --system "huggingface_hub[cli]==1.7.2" "fast-agent-mcp==0.6.2"
 
 hf download "$ARTIFACT_REPO" "inputs/$RUN_ID/bundle.tar.gz" --repo-type dataset --local-dir "$WORK"
 tar -xzf "$WORK/inputs/$RUN_ID/bundle.tar.gz" -C "$WORK"
@@ -191,37 +249,8 @@ env_flags=(
   --env "FAST_MODEL=$MODEL"
   --env "FAST_AGENT=$AGENT"
 )
-
 if [[ -n "$MESSAGE" ]]; then
   env_flags+=(--env "FAST_MESSAGE=$MESSAGE")
 fi
 
-ns_flags=()
-if [[ -n "$NAMESPACE" ]]; then
-  ns_flags+=(--namespace "$NAMESPACE")
-fi
-
-job_id="$(
-hf jobs run \
-  --detach \
-  --flavor "$FLAVOR" \
-  --timeout "$TIMEOUT" \
-  "${ns_flags[@]}" \
-  "${secret_flags[@]}" \
-  "${env_flags[@]}" \
-  -- \
-  "$IMAGE" \
-  bash -lc "$job_cmd"
-)"
-
-job_id="$(echo "$job_id" | tail -n 1 | xargs)"
-
-if [[ "$JSON_OUTPUT" == "1" ]]; then
-  cat <<JSON
-{"job_id":"$job_id","run_id":"$RUN_ID","artifact_repo":"$ARTIFACT_REPO"}
-JSON
-else
-  echo "JOB_ID=$job_id"
-  echo "RUN_ID=$RUN_ID"
-  echo "ARTIFACT_REPO=$ARTIFACT_REPO"
-fi
+submit_bundle_job

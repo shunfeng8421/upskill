@@ -7,6 +7,7 @@ import json
 from dataclasses import replace
 
 from upskill.artifacts import (
+    bundle_cards,
     copy_config_file,
     ensure_directory,
     materialize_skill_bundle,
@@ -53,6 +54,10 @@ class LocalFastAgentExecutor:
         workspace_dir = ensure_directory(artifact_dir / "workspace")
         materialize_workspace(workspace_dir, normalized_request.workspace_files)
 
+        cards_dir = bundle_cards(
+            normalized_request.cards_source_dir,
+            artifact_dir / "cards",
+        )
         skills_dir = materialize_skill_bundle(artifact_dir / "skills", normalized_request)
         preserved_config_path = copy_config_file(
             normalized_request.fastagent_config_path,
@@ -75,6 +80,7 @@ class LocalFastAgentExecutor:
         stderr_path = artifact_dir / "stderr.txt"
         command = build_fast_agent_command(
             normalized_request,
+            cards_dir=cards_dir,
             skills_dir=skills_dir,
             results_path=results_path,
             fast_agent_bin=self._fast_agent_bin,

@@ -22,6 +22,8 @@ from upskill.models import (
     RunResult,
     Skill,
     SkillMetadata,
+    SkillRecord,
+    SkillState,
     TestCase,
     TestResult,
 )
@@ -35,6 +37,8 @@ __all__ = [
     "RunResult",
     "Skill",
     "SkillMetadata",
+    "SkillRecord",
+    "SkillState",
     "TestCase",
     "TestResult",
     "create_batch_folder",

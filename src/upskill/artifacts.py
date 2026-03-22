@@ -6,11 +6,10 @@ import json
 import re
 import shutil
 from dataclasses import asdict
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from pathlib import Path
-
     from upskill.executors.contracts import ExecutionRequest
 
 _NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
@@ -28,11 +27,21 @@ def ensure_directory(path: Path) -> Path:
     return path
 
 
+def validate_workspace_relative_path(relative_path: str) -> Path:
+    """Validate that a workspace file path stays within the workspace root."""
+    normalized = Path(relative_path)
+    if normalized.is_absolute():
+        raise ValueError(f"Workspace file path must be relative: {relative_path}")
+    if any(part == ".." for part in normalized.parts):
+        raise ValueError(f"Workspace file path must not traverse parents: {relative_path}")
+    return normalized
+
+
 def materialize_workspace(workspace_dir: Path, workspace_files: dict[str, str]) -> None:
     """Write test workspace files into a preserved workspace directory."""
     ensure_directory(workspace_dir)
     for relative_path, content in workspace_files.items():
-        file_path = workspace_dir / relative_path
+        file_path = workspace_dir / validate_workspace_relative_path(relative_path)
         file_path.parent.mkdir(parents=True, exist_ok=True)
         file_path.write_text(content, encoding="utf-8")
 

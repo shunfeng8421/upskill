@@ -13,6 +13,7 @@ if TYPE_CHECKING:
 def build_fast_agent_command(
     request: ExecutionRequest,
     *,
+    cards_dir: Path,
     skills_dir: Path,
     results_path: Path,
     fast_agent_bin: str = "fast-agent",
@@ -21,6 +22,12 @@ def build_fast_agent_command(
     command = [
         fast_agent_bin,
         "go",
+        "--config-path",
+        str(request.fastagent_config_path),
+        "--card",
+        str(cards_dir),
+        "--agent",
+        request.agent,
         "--model",
         request.model,
         "--skills-dir",

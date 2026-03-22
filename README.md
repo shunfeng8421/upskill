@@ -9,7 +9,7 @@ Generate and evaluate agent skills based on traces with agents. Create skills wi
 Install upskill:
 
 ```bash
-pip install upskill
+uv pip install upskill
 # or just use uv
 uvx upskill
 ```
@@ -59,8 +59,17 @@ Run the quality gates locally:
 uv run scripts/format.py
 uv run scripts/lint.py
 uv run scripts/typecheck.py
+uv run scripts/cpd.py --check
 uv run --extra dev pytest -v
 ```
+
+Or use the helper script to run the whole sequence:
+
+```bash
+uv run scripts/check.py
+```
+
+Add `--sync` to include `uv sync --extra dev`, or `--skip-tests` for a faster static-only pass.
 
 To auto-format before re-running checks:
 
@@ -74,6 +83,7 @@ Current enforced standards:
 - `ruff check` for style, imports, modernization, bugbear, simplify, and import-hygiene rules
 - cyclomatic complexity via Ruff `C90` with `max-complexity = 15`
 - `ty check` across `src`, `tests`, and `scripts`
+- `pmd cpd` via `scripts/cpd.py --check` to flag duplicated code in `src/`
 - `pytest` for the test suite
 
 CI enforcement lives in `.github/workflows/ci.yml` and runs on pushes and pull requests targeting

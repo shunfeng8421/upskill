@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -26,6 +27,15 @@ from upskill.models import (
 from upskill.validators import get_validator
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class PendingEvaluationRequest:
+    """A single evaluation request prepared for backend submission."""
+
+    phase_label: str
+    test_index: int
+    request: ExecutionRequest
 
 
 def _write_test_result_summary(path: Path, result: TestResult) -> None:
@@ -160,9 +170,8 @@ def format_test_prompt(test_case: TestCase) -> str:
     return prompt
 
 
-async def _run_test_with_evaluator(
+def build_eval_execution_request(
     test_case: TestCase,
-    executor: Executor,
     *,
     skill: Skill | None,
     model: str,
@@ -171,13 +180,13 @@ async def _run_test_with_evaluator(
     artifact_dir: Path,
     agent_name: str = "evaluator",
     instance_name: str | None = None,
-) -> TestResult:
-    """Run a single test case through the configured executor."""
+) -> ExecutionRequest:
+    """Build the normalized execution request for a single evaluation test."""
     workspace_files = (
         dict(test_case.context.files) if test_case.context and test_case.context.files else {}
     )
     normalized_artifact_dir = artifact_dir.resolve()
-    request = ExecutionRequest(
+    return ExecutionRequest(
         prompt=format_test_prompt(test_case),
         model=model,
         agent=agent_name,
@@ -194,6 +203,78 @@ async def _run_test_with_evaluator(
             "has_validator": bool(test_case.validator),
         },
     )
+
+
+def build_eval_requests(
+    *,
+    skill: Skill,
+    test_cases: list[TestCase],
+    model: str,
+    fastagent_config_path: Path,
+    cards_source_dir: Path,
+    artifact_root: Path,
+    run_baseline: bool = True,
+) -> list[PendingEvaluationRequest]:
+    """Build all execution requests needed for an evaluation run."""
+    requests: list[PendingEvaluationRequest] = []
+
+    for phase_label, batch_skill in _iter_evaluation_phases(skill, run_baseline):
+        batch_root = ensure_directory(artifact_root / sanitize_artifact_name(phase_label))
+        for index, test_case in enumerate(test_cases, start=1):
+            instance_name = f"eval ({phase_label} test {index})"
+            requests.append(
+                PendingEvaluationRequest(
+                    phase_label=phase_label,
+                    test_index=index,
+                    request=build_eval_execution_request(
+                        test_case,
+                        skill=batch_skill,
+                        model=model,
+                        fastagent_config_path=fastagent_config_path,
+                        cards_source_dir=cards_source_dir,
+                        artifact_dir=batch_root / f"test_{index}",
+                        instance_name=instance_name,
+                    ),
+                )
+            )
+
+    return requests
+
+
+def _iter_evaluation_phases(
+    skill: Skill,
+    run_baseline: bool,
+) -> list[tuple[str, Skill | None]]:
+    phases: list[tuple[str, Skill | None]] = [("with-skill", skill)]
+    if run_baseline:
+        phases.append(("baseline", None))
+    return phases
+
+
+async def _run_test_with_evaluator(
+    test_case: TestCase,
+    executor: Executor,
+    *,
+    skill: Skill | None,
+    model: str,
+    fastagent_config_path: Path,
+    cards_source_dir: Path,
+    artifact_dir: Path,
+    agent_name: str = "evaluator",
+    instance_name: str | None = None,
+) -> TestResult:
+    """Run a single test case through the configured executor."""
+    request = build_eval_execution_request(
+        test_case,
+        skill=skill,
+        model=model,
+        fastagent_config_path=fastagent_config_path,
+        cards_source_dir=cards_source_dir,
+        artifact_dir=artifact_dir,
+        agent_name=agent_name,
+        instance_name=instance_name,
+    )
+    normalized_artifact_dir = request.artifact_dir
 
     try:
         handle = await executor.execute(request)

@@ -8,6 +8,15 @@ mkdir -p "$OUT_DIR/results" "$OUT_DIR/logs" "$OUT_DIR/status" "$OUT_DIR/workspac
 cp -f "$BUNDLE_DIR/manifest.json" "$OUT_DIR/manifest.json" || true
 
 COMMON=(fast-agent go --skills-dir "$BUNDLE_DIR/skills" --quiet)
+if [[ -f "$BUNDLE_DIR/fastagent.config.yaml" ]]; then
+  COMMON+=(--config-path "$BUNDLE_DIR/fastagent.config.yaml")
+fi
+if [[ -d "$BUNDLE_DIR/cards" ]]; then
+  COMMON+=(--card "$BUNDLE_DIR/cards")
+fi
+if [[ -f "$BUNDLE_DIR/agent.txt" ]]; then
+  COMMON+=(--agent "$(cat "$BUNDLE_DIR/agent.txt")")
+fi
 
 FAST_MODEL="${FAST_MODEL:?FAST_MODEL is required}"
 overall_status=0
