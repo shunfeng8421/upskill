@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import re
 from datetime import datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -468,6 +468,88 @@ class EvalResults(BaseModel):
         """Skill provides net benefit."""
         # Beneficial if: better success, OR same success with fewer tokens
         return self.skill_lift > 0.05 or (self.skill_lift >= 0 and self.token_savings > 0.2)
+
+
+class ScenarioJudgeConfig(BaseModel):
+    """Judge configuration for a scenario."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    criteria: list[str] | None = None
+
+
+class EvalScenario(BaseModel):
+    """Scenario definition for CI evaluation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(..., min_length=1)
+    skills: list[str] = Field(default_factory=list)
+    tests: str
+    judge: ScenarioJudgeConfig | None = None
+    include_baseline: bool = False
+
+
+class EvalManifest(BaseModel):
+    """Top-level CI manifest."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    scenarios: list[EvalScenario] = Field(default_factory=list)
+
+
+class ScenarioVariantResult(BaseModel):
+    """Aggregate result for one scenario variant."""
+
+    variant_id: str
+    variant_type: Literal["bundle", "ablation", "baseline"]
+    skills: list[str] = Field(default_factory=list)
+    omitted_skill: str | None = None
+    passed: bool
+    assertions_passed: int = 0
+    assertions_total: int = 0
+    hard_score: float = 0.0
+    judge_score: float | None = None
+    judge_summary: str | None = None
+    total_tokens: int = 0
+    average_turns: float = 0.0
+    run_folder: str | None = None
+
+
+class ScenarioContribution(BaseModel):
+    """Contribution delta for leaving one skill out of a bundle."""
+
+    skill: str
+    hard_score_delta: float = 0.0
+    judge_score_delta: float | None = None
+    passed_without_skill: bool = False
+
+
+class ScenarioReport(BaseModel):
+    """Report for one selected scenario."""
+
+    scenario_id: str
+    skills: list[str] = Field(default_factory=list)
+    tests_path: str
+    passed: bool
+    bundle: ScenarioVariantResult
+    ablations: list[ScenarioVariantResult] = Field(default_factory=list)
+    baseline: ScenarioVariantResult | None = None
+    contributions: list[ScenarioContribution] = Field(default_factory=list)
+
+
+class CiReport(BaseModel):
+    """Machine-readable report for a CI evaluation run."""
+
+    manifest_path: str
+    scope: str
+    base_ref: str | None = None
+    changed_files: list[str] = Field(default_factory=list)
+    changed_skills: list[str] = Field(default_factory=list)
+    selected_scenarios: list[str] = Field(default_factory=list)
+    success: bool = True
+    scenarios: list[ScenarioReport] = Field(default_factory=list)
 
 
 # Run logging models (similar to skills-test)
