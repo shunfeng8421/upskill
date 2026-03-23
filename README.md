@@ -4,12 +4,18 @@
 
 Generate and evaluate agent skills based on traces with agents. Create skills with teacher models (expensive/slow) that student models (cheap/fast) can use to perform harder tasks reliably.
 
+
+> [!TIP] 
+> 
+> UPskill v2 - recommended default config file now runs evaluations on Hugging Face Jobs. Make sure
+> to set your `HF_TOKEN` and use `--artifact-repo <dataset-name>` for job creation and result capture  
+
 ## Quick Start
 
 Install upskill:
 
 ```bash
-pip install upskill
+uv pip install upskill
 # or just use uv
 uvx upskill
 ```
@@ -41,6 +47,53 @@ View the results later.
 ```bash
 upskill runs --skill git-commit-messages
 ```
+
+## Development checks
+
+This repo uses a CI flow inspired by `fast-agent` with separate format, lint, typecheck, and test
+stages.
+
+Install dev dependencies:
+
+```bash
+uv sync --extra dev
+```
+
+Run the quality gates locally:
+
+```bash
+uv run scripts/format.py
+uv run scripts/lint.py
+uv run scripts/typecheck.py
+uv run scripts/cpd.py --check
+uv run --extra dev pytest -v
+```
+
+Or use the helper script to run the whole sequence:
+
+```bash
+uv run scripts/check.py
+```
+
+Add `--sync` to include `uv sync --extra dev`, or `--skip-tests` for a faster static-only pass.
+
+To auto-format before re-running checks:
+
+```bash
+uv run --extra dev scripts/format.py --write
+```
+
+Current enforced standards:
+
+- `ruff format --check` for formatting
+- `ruff check` for style, imports, modernization, bugbear, simplify, and import-hygiene rules
+- cyclomatic complexity via Ruff `C90` with `max-complexity = 15`
+- `ty check` across `src`, `tests`, and `scripts`
+- `pmd cpd` via `scripts/cpd.py --check` to flag duplicated code in `src/`
+- `pytest` for the test suite
+
+CI enforcement lives in `.github/workflows/ci.yml` and runs on pushes and pull requests targeting
+`main`.
 
 ## Model Handling Overview
 
@@ -82,13 +135,15 @@ upskill generate TASK [OPTIONS]
 
 **Options:**
 - `-e, --example` - Input -> output example (can be repeated)
-- `--tool` - Generate from MCP tool schema (path#tool_name)
 - `-f, --from PATH` - Improve from existing skill dir or agent trace file (auto-detected)
 - `-m, --model MODEL` - Skill generation model (e.g., 'sonnet', 'haiku', 'anthropic.claude-sonnet-4-20250514')
 - `--test-gen-model MODEL` - Override test generation model for this run
 - `-o, --output PATH` - Output directory for skill
 - `--no-eval` - Skip evaluation and refinement
 - `--eval-model MODEL` - Different model to evaluate skill on
+- `--executor [local|jobs]` - Execution backend for evaluation/refinement; overrides config
+- `--artifact-repo TEXT` - Dataset repo for remote fast-agent job artifacts (required with `--executor jobs`)
+- `--max-parallel N` - Max concurrent evaluation executions; overrides config
 - `--runs-dir PATH` - Directory for run logs (default: ./runs)
 - `--log-runs / --no-log-runs` - Log run data (default: enabled)
 
@@ -100,6 +155,9 @@ upskill generate "parse JSON Schema files"
 
 # Make and evaluate skills for less powerful models
 upskill generate "write git commits" --model sonnet --eval-model haiku
+
+# Remote execution on Hugging Face Jobs
+upskill generate "parse invoices" --executor jobs --artifact-repo <user>/upskill-tests
 
 # Improve an existing skill (auto-detected as directory)
 upskill generate "add more error handling examples" --from ./skills/api-errors/
@@ -147,9 +205,11 @@ upskill eval SKILL_PATH [OPTIONS]
 - `-t, --tests PATH` - Test cases JSON file
 - `-m, --model MODEL` - Model(s) to evaluate against (repeatable for multi-model benchmarking)
 - `--test-gen-model MODEL` - Override test generation model when tests must be generated
-- `--runs N` - Number of runs per model (default: 1)
+- `--runs N` - Number of runs per model; overrides config
 - `--no-baseline` - Skip baseline comparison (simple eval mode only; ignored in benchmark mode)
 - `-v, --verbose` - Show per-test results
+- `--executor [local|jobs]` - Execution backend for evaluation; overrides config
+- `--max-parallel N` - Max concurrent evaluation executions; overrides config
 - `--log-runs / --no-log-runs` - Log run data (default: enabled)
 - `--runs-dir PATH` - Directory for run logs
 
@@ -403,7 +463,13 @@ eval_model: haiku               # Default evaluation model (optional)
 test_gen_model: null            # Optional test generation model
 skills_dir: ./skills            # Where to save skills
 runs_dir: ./runs                # Where to save run logs
-max_refine_attempts: 3          # Refinement iterations
+max_refine_attempts: 2          # Refinement iterations
+executor: local                 # Default execution backend
+num_runs: 1                     # Default eval/benchmark runs when --runs is omitted
+max_parallel: 5                 # Default concurrent evaluation executions
+jobs_secrets: HF_TOKEN          # Comma-separated HF Jobs env var names to forward
+jobs_image: ghcr.io/astral-sh/uv:python3.13-bookworm  # HF Jobs container image
+# fastagent_config: ./fastagent.config.yaml  # Optional FastAgent config override
 ```
 
 `test_gen_model` fallback behavior:
@@ -416,6 +482,22 @@ max_refine_attempts: 3          # Refinement iterations
 
 Backward compatibility: `model` is still accepted in config files as a legacy alias for
 `skill_generation_model`.
+
+CLI flags override config values for execution settings:
+
+- `--executor` overrides `executor`
+- `--runs` overrides `num_runs`
+- `--max-parallel` overrides `max_parallel`
+- `--jobs-secrets` overrides `jobs_secrets`
+
+If you set `executor: jobs`, you still need the required jobs-specific CLI inputs such as
+`--artifact-repo`.
+
+`jobs_secrets` is a comma-separated list of environment variable names to forward into
+remote HF Jobs runs. It should contain secret names such as `HF_TOKEN` or
+`ANTHROPIC_API_KEY`, not literal secret values.
+
+`jobs_image` controls which container image HF Jobs uses for remote execution.
 
 Config lookup order:
 

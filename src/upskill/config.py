@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 import yaml
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field
@@ -130,8 +131,31 @@ class Config(BaseModel):
     )
 
     # Generation settings
-    auto_eval: bool = Field(default=True, description="Run eval after generation")
     max_refine_attempts: int = Field(default=2, description="Max refinement iterations")
+
+    # Execution settings
+    executor: Literal["local", "jobs"] = Field(
+        default="local",
+        description="Default execution backend for evaluation and refinement",
+    )
+    num_runs: int | None = Field(
+        default=None,
+        ge=1,
+        description="Default runs per model for eval/benchmark when CLI --runs is omitted",
+    )
+    max_parallel: int = Field(
+        default=5,
+        ge=1,
+        description="Maximum concurrent evaluation executions per phase",
+    )
+    jobs_secrets: str = Field(
+        default="HF_TOKEN",
+        description="Comma-separated env var names to forward to HF Jobs when using executor=jobs",
+    )
+    jobs_image: str = Field(
+        default="ghcr.io/astral-sh/uv:python3.13-bookworm",
+        description="Container image used for HF Jobs when using executor=jobs",
+    )
 
     # FastAgent settings
     fastagent_config: Path | None = Field(default=None, description="Path to fastagent.config.yaml")
@@ -175,6 +199,14 @@ class Config(BaseModel):
     def effective_eval_model(self) -> str:
         """Get the model to use for evaluation."""
         return self.eval_model or self.skill_generation_model
+
+    def effective_num_runs(self, command: Literal["eval", "benchmark"]) -> int:
+        """Get the number of runs to use when CLI ``--runs`` is omitted."""
+        if self.num_runs is not None:
+            return self.num_runs
+        if command == "benchmark":
+            return 3
+        return 1
 
     @property
     def model(self) -> str:

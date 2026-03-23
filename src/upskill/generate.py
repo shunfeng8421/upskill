@@ -1,14 +1,16 @@
-"""Skill generation from task descriptions using FastAgent."""
+"""Skill generation from task descriptions using fast-agent."""
 
 from __future__ import annotations
 
 from datetime import UTC, datetime
-
-from fast_agent.interfaces import AgentProtocol
-from fast_agent.skills.registry import SkillManifest
+from typing import TYPE_CHECKING
 
 from upskill.manifest_utils import parse_skill_manifest_text
-from upskill.models import Skill, SkillMetadata, TestCase, TestCaseSuite
+from upskill.models import Skill, SkillMetadata, SkillRecord, SkillState, TestCase, TestCaseSuite
+
+if TYPE_CHECKING:
+    from fast_agent.interfaces import AgentProtocol
+    from fast_agent.skills.registry import SkillManifest
 
 # Few-shot examples for test generation
 TEST_EXAMPLES = """
@@ -72,31 +74,36 @@ TEST_GENERATION_PROMPT = (
     "## Your Task\n\n"
     f"Task: {TASK_PLACEHOLDER}\n\n"
     "Generate test cases that verify the agent can apply the skill correctly.\n\n"
-
     "Each TestCase MUST include at least a list of expected strings in the expected field.\n"
     "Focus on practical scenarios that test understanding of the core concepts."
 )
+
 
 def _build_skill_from_manifest(
     manifest: SkillManifest,
     *,
     model: str | None,
-    source_task: str,
-    base_skill: Skill | None = None,
-) -> Skill:
-    references = base_skill.references if base_skill else {}
-    scripts = base_skill.scripts if base_skill else {}
-    return Skill(
-        name=manifest.name,
-        description=manifest.description,
-        body=manifest.body,
-        ## treating these as future for now as skill generator doesn't generate additional artifacts
-        references=references,
-        scripts=scripts,
-        metadata=SkillMetadata(
-            generated_by=model,
-            generated_at=datetime.now(UTC),
-            source_task=source_task,
+    source_task: str | None,
+    base_skill: SkillRecord | None = None,
+) -> SkillRecord:
+    references = base_skill.skill.references if base_skill else {}
+    scripts = base_skill.skill.scripts if base_skill else {}
+    return SkillRecord(
+        skill=Skill(
+            name=manifest.name,
+            description=manifest.description,
+            body=manifest.body,
+            ## treating these as future for now as skill generator doesn't generate additional artifacts
+            references=references,
+            scripts=scripts,
+        ),
+        state=SkillState(
+            metadata=SkillMetadata(
+                generated_by=model,
+                generated_at=datetime.now(UTC),
+                source_task=source_task,
+            ),
+            tests=list(base_skill.state.tests) if base_skill else [],
         ),
     )
 
@@ -106,15 +113,14 @@ async def generate_skill(
     generator: AgentProtocol,
     examples: list[str] | None = None,
     model: str | None = None,
-) -> Skill:
-    """Generate a skill from a task description using FastAgent."""
+) -> SkillRecord:
+    """Generate a skill from a task description using fast-agent."""
 
     prompt = f"Create a skill document that teaches an AI agent how to: {task}"
     if examples:
         prompt += "\n\nExample input/output pairs for this task:\n" + "\n".join(
             f"- {ex}" for ex in examples
         )
-
 
     skill_text = await generator.send(prompt)
     manifest, error = parse_skill_manifest_text(skill_text)
@@ -131,9 +137,8 @@ async def generate_skill(
 async def generate_tests(
     task: str,
     generator: AgentProtocol,
-    model: str | None = None,
 ) -> list[TestCase]:
-    """Generate synthetic test cases from a task description using FastAgent."""
+    """Generate synthetic test cases from a task description using fast-agent."""
 
     prompt = TEST_GENERATION_PROMPT.replace(TASK_PLACEHOLDER, task)
 
@@ -162,18 +167,18 @@ async def generate_tests(
 
 
 async def refine_skill(
-    skill: Skill,
+    skill: SkillRecord,
     failures: list[str],
     generator: AgentProtocol,
     model: str | None = None,
-) -> Skill:
-    """Refine a skill based on evaluation failures using FastAgent."""
+) -> SkillRecord:
+    """Refine a skill based on evaluation failures using fast-agent."""
 
     prompt = f"""Improve this skill based on failures:
 
-Name: {skill.name}
-Description: {skill.description}
-Body: {skill.body[:500]}...
+Name: {skill.skill.name}
+Description: {skill.skill.description}
+Body: {skill.skill.body[:500]}...
 
 Failures:
 {chr(10).join(f"- {f}" for f in failures[:3])}
@@ -190,7 +195,7 @@ Do not wrap the output in code fences.
     return _build_skill_from_manifest(
         manifest,
         model=model,
-        source_task=skill.metadata.source_task,
+        source_task=skill.state.metadata.source_task,
         base_skill=skill,
     )
 
@@ -225,11 +230,11 @@ Do not wrap the output in code fences or JSON.
 
 
 async def improve_skill(
-    skill: Skill,
+    skill: SkillRecord,
     instructions: str,
     generator: AgentProtocol,
     model: str | None = None,
-) -> Skill:
+) -> SkillRecord:
     """Improve an existing skill based on instructions.
 
     Args:
@@ -245,12 +250,11 @@ async def improve_skill(
     # model = model or config.skill_generation_model
 
     prompt = IMPROVE_PROMPT.format(
-        name=skill.name,
-        description=skill.description,
-        body=skill.body,
+        name=skill.skill.name,
+        description=skill.skill.description,
+        body=skill.skill.body,
         instructions=instructions,
     )
-
 
     skill_text = await generator.send(prompt)
     manifest, error = parse_skill_manifest_text(skill_text)
@@ -260,6 +264,6 @@ async def improve_skill(
     return _build_skill_from_manifest(
         manifest,
         model=model,
-        source_task=f"Improved from {skill.name}: {instructions}",
+        source_task=f"Improved from {skill.skill.name}: {instructions}",
         base_skill=skill,
     )

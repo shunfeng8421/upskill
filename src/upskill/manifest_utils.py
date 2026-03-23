@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
-from pathlib import Path
+from typing import TYPE_CHECKING
 
-from fast_agent.skills.registry import SkillManifest, SkillRegistry
+from fast_agent.skills.registry import SkillRegistry
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+    from fast_agent.skills.registry import SkillManifest
 
 
 def parse_skill_manifest_text(

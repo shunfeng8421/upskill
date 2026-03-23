@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 
 from upskill.config import Config
-from upskill.model_resolution import resolve_models
+from upskill.model_resolution import build_fastagent_model_references, resolve_models
 
 
 def test_resolve_generate_uses_generation_model_for_test_gen_by_default() -> None:
@@ -42,6 +42,26 @@ def test_resolve_generate_cli_test_gen_model_overrides_config() -> None:
     assert resolved.test_generation_model == "opus"
 
 
+def test_build_fastagent_model_references_for_generate_uses_resolved_models() -> None:
+    config = Config(skill_generation_model="sonnet", test_gen_model="haiku")
+
+    resolved = resolve_models(
+        "generate",
+        config=config,
+        cli_model="opus",
+        cli_test_gen_model="kimi",
+    )
+    references = build_fastagent_model_references(config=config, resolved=resolved)
+
+    assert references == {
+        "system": {
+            "default": "opus",
+            "skill_gen": "opus",
+            "test_gen": "kimi",
+        }
+    }
+
+
 def test_resolve_eval_defaults_and_simple_mode() -> None:
     config = Config(skill_generation_model="sonnet", eval_model="haiku", test_gen_model=None)
 
@@ -65,6 +85,26 @@ def test_resolve_eval_cli_test_gen_model_overrides_config() -> None:
     )
 
     assert resolved.test_generation_model == "opus"
+
+
+def test_build_fastagent_model_references_for_eval_keeps_configured_skill_generator() -> None:
+    config = Config(skill_generation_model="sonnet", test_gen_model="haiku")
+
+    resolved = resolve_models(
+        "eval",
+        config=config,
+        cli_models=["kimi"],
+        cli_test_gen_model="opus",
+    )
+    references = build_fastagent_model_references(config=config, resolved=resolved)
+
+    assert references == {
+        "system": {
+            "default": "sonnet",
+            "skill_gen": "sonnet",
+            "test_gen": "opus",
+        }
+    }
 
 
 def test_resolve_eval_benchmark_mode_disables_baseline() -> None:
@@ -149,7 +189,7 @@ def test_resolve_unsupported_command_raises() -> None:
 
 
 def test_config_legacy_model_key_maps_to_skill_generation_model() -> None:
-    config = Config(model="haiku")
+    config = Config.model_validate({"model": "haiku"})
 
     assert config.skill_generation_model == "haiku"
     assert config.model == "haiku"

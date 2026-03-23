@@ -5,9 +5,12 @@ from __future__ import annotations
 import json
 import re
 from datetime import datetime
-from pathlib import Path
+from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 class SkillMetadata(BaseModel):
@@ -59,6 +62,7 @@ class TestCaseContext(BaseModel):
 class TestCase(BaseModel):
     """A test case for skill evaluation."""
 
+    __test__ = False
     model_config = ConfigDict(extra="forbid")
 
     input: str  # Task/prompt to give the agent
@@ -69,8 +73,6 @@ class TestCase(BaseModel):
     output_file: str | None = None  # File to validate instead of agent output
     validator: str | None = None  # Validator name (e.g., "hf_eval_yaml")
     validator_config: dict[str, str | int | float | bool] | None = None
-
-
 
 
 class TestCaseSuite(BaseModel):
@@ -91,6 +93,112 @@ class SkillDraft(BaseModel):
     scripts: dict[str, str] | None = None
 
 
+def _parse_skill_frontmatter(
+    content: str,
+    *,
+    default_name: str,
+) -> tuple[str, str, list[str] | None, str | None, bool, bool, str]:
+    """Parse SKILL.md frontmatter and return normalized fields."""
+    name = default_name
+    description = ""
+    allowed_tools: list[str] | None = None
+    argument_hint: str | None = None
+    user_invocable = True
+    disable_model_invocation = False
+    body = content
+
+    if not content.startswith("---"):
+        return (
+            name,
+            description,
+            allowed_tools,
+            argument_hint,
+            user_invocable,
+            disable_model_invocation,
+            body,
+        )
+
+    parts = content.split("---", 2)
+    if len(parts) < 3:
+        return (
+            name,
+            description,
+            allowed_tools,
+            argument_hint,
+            user_invocable,
+            disable_model_invocation,
+            body,
+        )
+
+    frontmatter = parts[1].strip()
+    body = parts[2].strip()
+
+    for line in frontmatter.splitlines():
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        key = key.strip()
+        value = value.strip()
+
+        if key == "name":
+            name = value
+        elif key == "description":
+            description = value
+        elif key == "allowed-tools":
+            allowed_tools = [tool.strip() for tool in value.split(",")]
+        elif key == "argument-hint":
+            argument_hint = value
+        elif key == "user-invocable":
+            user_invocable = value.lower() != "false"
+        elif key == "disable-model-invocation":
+            disable_model_invocation = value.lower() == "true"
+
+    return (
+        name,
+        description,
+        allowed_tools,
+        argument_hint,
+        user_invocable,
+        disable_model_invocation,
+        body,
+    )
+
+
+class SkillState(BaseModel):
+    """Upskill-managed state stored separately from ``SKILL.md``."""
+
+    metadata: SkillMetadata = Field(default_factory=SkillMetadata)
+    tests: list[TestCase] = Field(default_factory=list)
+
+
+def _load_skill_state(path: Path) -> SkillState:
+    """Load optional upskill-managed state stored alongside a skill."""
+    state = SkillState()
+    meta_path = path / "skill_meta.json"
+    if not meta_path.exists():
+        return state
+
+    meta_dict = json.loads(meta_path.read_text())
+    if "metadata" in meta_dict:
+        state.metadata = SkillMetadata.model_validate(meta_dict["metadata"])
+    if "tests" in meta_dict:
+        state.tests = [TestCase.model_validate(test_case) for test_case in meta_dict["tests"]]
+    return state
+
+
+def _load_artifact_directory(path: Path, directory_name: str) -> dict[str, str]:
+    """Load filename-to-content mappings from a skill artifact directory."""
+    directory = path / directory_name
+    if not directory.exists():
+        return {}
+
+    return {
+        file_path.name: file_path.read_text()
+        for file_path in directory.iterdir()
+        if file_path.is_file()
+    }
+
+
 class Skill(BaseModel):
     """A generated agent skill following the Claude Code SKILL.md spec."""
 
@@ -102,16 +210,10 @@ class Skill(BaseModel):
     user_invocable: bool = True
     disable_model_invocation: bool = False
 
-    # upskill metadata (persisted to skill_meta.json)
-    metadata: SkillMetadata = Field(default_factory=SkillMetadata)
-
     # Content
     body: str  # Main instructions markdown
     references: dict[str, str] = Field(default_factory=dict)  # filename -> content
     scripts: dict[str, str] = Field(default_factory=dict)  # filename -> code
-
-    # Test cases (persisted to skill_meta.json)
-    tests: list[TestCase] = Field(default_factory=list)
 
     @field_validator("name")
     @classmethod
@@ -145,27 +247,12 @@ class Skill(BaseModel):
 
         return "\n".join(frontmatter_lines) + "\n\n" + self.body
 
-    def save(self, path: Path, tests: list[TestCase] | None = None) -> None:
-        """Write skill directory with all files.
-
-        Args:
-            path: Directory to save skill to
-            tests: Optional test cases to persist (overrides self.tests if provided)
-        """
+    def save(self, path: Path) -> None:
+        """Write the skill document and artifact files."""
         path.mkdir(parents=True, exist_ok=True)
 
         # Write SKILL.md (Claude Code compatible)
         (path / "SKILL.md").write_text(self.render())
-
-        # Write skill_meta.json (upskill-specific metadata + tests)
-        tests_to_save = tests if tests is not None else self.tests
-        meta_dict = {
-            "metadata": self.metadata.model_dump(mode="json"),
-            "tests": [t.model_dump(mode="json") for t in tests_to_save],
-        }
-        (path / "skill_meta.json").write_text(
-            json.dumps(meta_dict, indent=2, default=str)
-        )
 
         # Write references
         if self.references:
@@ -183,80 +270,23 @@ class Skill(BaseModel):
 
     @classmethod
     def load(cls, path: Path) -> Skill:
-        """Load a skill from a directory.
-
-        Args:
-            path: Directory containing SKILL.md and optionally skill_meta.json
-
-        Returns:
-            Loaded Skill instance
-        """
+        """Load a skill document from a directory."""
         skill_md_path = path / "SKILL.md"
         if not skill_md_path.exists():
             raise FileNotFoundError(f"SKILL.md not found in {path}")
 
         content = skill_md_path.read_text()
-
-        # Parse YAML frontmatter
-        name = path.name  # Default to directory name
-        description = ""
-        allowed_tools: list[str] | None = None
-        argument_hint: str | None = None
-        user_invocable = True
-        disable_model_invocation = False
-        body = content
-
-        if content.startswith("---"):
-            parts = content.split("---", 2)
-            if len(parts) >= 3:
-                frontmatter = parts[1].strip()
-                body = parts[2].strip()
-
-                for line in frontmatter.split("\n"):
-                    if ":" in line:
-                        key, value = line.split(":", 1)
-                        key = key.strip()
-                        value = value.strip()
-
-                        if key == "name":
-                            name = value
-                        elif key == "description":
-                            description = value
-                        elif key == "allowed-tools":
-                            allowed_tools = [t.strip() for t in value.split(",")]
-                        elif key == "argument-hint":
-                            argument_hint = value
-                        elif key == "user-invocable":
-                            user_invocable = value.lower() != "false"
-                        elif key == "disable-model-invocation":
-                            disable_model_invocation = value.lower() == "true"
-
-        # Load metadata and tests from skill_meta.json if present
-        metadata = SkillMetadata()
-        tests: list[TestCase] = []
-        meta_path = path / "skill_meta.json"
-        if meta_path.exists():
-            meta_dict = json.loads(meta_path.read_text())
-            if "metadata" in meta_dict:
-                metadata = SkillMetadata.model_validate(meta_dict["metadata"])
-            if "tests" in meta_dict:
-                tests = [TestCase.model_validate(t) for t in meta_dict["tests"]]
-
-        # Load references
-        references: dict[str, str] = {}
-        refs_dir = path / "references"
-        if refs_dir.exists():
-            for ref_file in refs_dir.iterdir():
-                if ref_file.is_file():
-                    references[ref_file.name] = ref_file.read_text()
-
-        # Load scripts
-        scripts: dict[str, str] = {}
-        scripts_dir = path / "scripts"
-        if scripts_dir.exists():
-            for script_file in scripts_dir.iterdir():
-                if script_file.is_file():
-                    scripts[script_file.name] = script_file.read_text()
+        (
+            name,
+            description,
+            allowed_tools,
+            argument_hint,
+            user_invocable,
+            disable_model_invocation,
+            body,
+        ) = _parse_skill_frontmatter(content, default_name=path.name)
+        references = _load_artifact_directory(path, "references")
+        scripts = _load_artifact_directory(path, "scripts")
 
         return cls(
             name=name,
@@ -265,11 +295,34 @@ class Skill(BaseModel):
             argument_hint=argument_hint,
             user_invocable=user_invocable,
             disable_model_invocation=disable_model_invocation,
-            metadata=metadata,
             body=body,
             references=references,
             scripts=scripts,
-            tests=tests,
+        )
+
+
+class SkillRecord(BaseModel):
+    """Persisted skill document plus separately managed upskill state."""
+
+    skill: Skill
+    state: SkillState = Field(default_factory=SkillState)
+
+    def save(self, path: Path) -> None:
+        """Write the skill document and managed metadata/tests."""
+        path.mkdir(parents=True, exist_ok=True)
+        self.skill.save(path)
+        meta_dict = {
+            "metadata": self.state.metadata.model_dump(mode="json"),
+            "tests": [test.model_dump(mode="json") for test in self.state.tests],
+        }
+        (path / "skill_meta.json").write_text(json.dumps(meta_dict, indent=2, default=str))
+
+    @classmethod
+    def load(cls, path: Path) -> SkillRecord:
+        """Load a persisted skill record from disk."""
+        return cls(
+            skill=Skill.load(path),
+            state=_load_skill_state(path),
         )
 
 
@@ -314,6 +367,7 @@ class ConversationStats(BaseModel):
 class TestResult(BaseModel):
     """Result of running a single test case."""
 
+    __test__ = False
     test_case: TestCase
     success: bool
     output: str | None = None
