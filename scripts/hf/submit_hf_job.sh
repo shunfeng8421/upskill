@@ -224,7 +224,7 @@ WORK=/workspace
 mkdir -p "$WORK/out"
 cd "$WORK"
 
-uv pip install --system "huggingface_hub[cli]==1.7.2" "fast-agent-mcp==0.6.2"
+uv pip install --system "huggingface_hub==1.7.2" "fast-agent-mcp==0.6.7"
 
 hf download "$ARTIFACT_REPO" "inputs/$RUN_ID/bundle.tar.gz" --repo-type dataset --local-dir "$WORK"
 tar -xzf "$WORK/inputs/$RUN_ID/bundle.tar.gz" -C "$WORK"

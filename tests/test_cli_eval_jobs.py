@@ -2,11 +2,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import click
 import pytest
+from click.testing import CliRunner
 
-from upskill.cli import _eval_async
+from upskill.cli import _eval_async, _jobs_execution_options, _raise_on_execution_errors
 from upskill.config import Config
 from upskill.evaluate import apply_eval_metrics
+from upskill.hf_jobs import JobsConfig
 from upskill.logging import load_batch_summary, load_run_result
 from upskill.models import (
     ConversationStats,
@@ -70,6 +73,69 @@ def _write_skill_fixture(skill_dir: Path) -> SkillRecord:
     return record
 
 
+def test_jobs_execution_options_waits_by_default() -> None:
+    @click.command()
+    @_jobs_execution_options(
+        executor_help="Execution backend for tests",
+        runs_dir_help="Runs directory for tests",
+    )
+    def command(
+        executor: str | None,
+        artifact_repo: str | None,
+        wait: bool,
+        jobs_timeout: str,
+        jobs_flavor: str,
+        jobs_secrets: str | None,
+        jobs_namespace: str | None,
+        max_parallel: int | None,
+        runs_dir: str | None,
+        log_runs: bool,
+    ) -> None:
+        del (
+            executor,
+            artifact_repo,
+            jobs_timeout,
+            jobs_flavor,
+            jobs_secrets,
+            jobs_namespace,
+            max_parallel,
+            runs_dir,
+            log_runs,
+        )
+        click.echo(f"wait={wait}")
+
+    runner = CliRunner()
+
+    default_result = runner.invoke(command)
+    assert default_result.exit_code == 0
+    assert "wait=True" in default_result.output
+
+    no_wait_result = runner.invoke(command, ["--no-wait"])
+    assert no_wait_result.exit_code == 0
+    assert "wait=False" in no_wait_result.output
+
+
+def test_raise_on_execution_errors_surfaces_backend_failures() -> None:
+    test_case = TestCase(input="prompt one", expected=ExpectedSpec(contains=["answer"]))
+    results = EvalResults(
+        skill_name="pull-request-descriptions",
+        model="haiku",
+        with_skill_results=[
+            TestResult(
+                test_case=test_case,
+                success=False,
+                error="fast-agent exited with code 1.",
+            )
+        ],
+    )
+
+    with pytest.raises(click.ClickException, match="execution errors") as exc_info:
+        _raise_on_execution_errors(results, context="Evaluation on haiku")
+
+    assert "with-skill test 1" in str(exc_info.value)
+    assert "fast-agent exited with code 1." in str(exc_info.value)
+
+
 @pytest.mark.asyncio
 async def test_eval_jobs_wait_persists_simple_run_summaries(
     tmp_path: Path,
@@ -87,6 +153,7 @@ async def test_eval_jobs_wait_persists_simple_run_summaries(
     async def fake_evaluate_skill(*args: object, **kwargs: object) -> EvalResults:
         del args
         assert kwargs["executor"] is fake_executor
+        assert kwargs["operation"] == "eval"
         max_parallel = kwargs["max_parallel"]
         assert isinstance(max_parallel, int)
         max_parallel_calls.append(max_parallel)
@@ -136,6 +203,203 @@ async def test_eval_jobs_wait_persists_simple_run_summaries(
 
 
 @pytest.mark.asyncio
+async def test_eval_uses_config_execution_defaults_when_cli_unset(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    skill_record = _write_skill_fixture(tmp_path / "skill")
+    config = Config(
+        runs_dir=tmp_path / "runs",
+        fastagent_config=tmp_path / "fastagent.config.yaml",
+        executor="jobs",
+        num_runs=2,
+        max_parallel=4,
+        jobs_secrets="HF_TOKEN,ANTHROPIC_API_KEY",
+        jobs_image="ghcr.io/example/custom:latest",
+    )
+    fake_executor = object()
+    build_calls: list[str] = []
+    calls: list[tuple[int, bool]] = []
+
+    monkeypatch.setattr("upskill.cli.Config.load", lambda: config)
+
+    def fake_build_executor(name: str, **kwargs: object) -> object:
+        build_calls.append(name)
+        jobs_config = kwargs["jobs_config"]
+        assert isinstance(jobs_config, JobsConfig)
+        assert jobs_config.jobs_secrets == "HF_TOKEN,ANTHROPIC_API_KEY"
+        assert jobs_config.jobs_image == "ghcr.io/example/custom:latest"
+        return fake_executor
+
+    async def fake_evaluate_skill(*args: object, **kwargs: object) -> EvalResults:
+        del args
+        max_parallel = kwargs["max_parallel"]
+        run_baseline = kwargs["run_baseline"]
+        assert kwargs["executor"] is fake_executor
+        assert isinstance(max_parallel, int)
+        assert isinstance(run_baseline, bool)
+        calls.append((max_parallel, run_baseline))
+        return _make_eval_results(
+            skill=skill_record.skill,
+            model=str(kwargs["model"]),
+            test_cases=skill_record.state.tests,
+            run_baseline=False,
+        )
+
+    monkeypatch.setattr("upskill.cli._build_executor", fake_build_executor)
+    monkeypatch.setattr("upskill.cli.evaluate_skill", fake_evaluate_skill)
+
+    await _eval_async(
+        skill_path=str(tmp_path / "skill"),
+        tests=None,
+        models=["haiku"],
+        test_gen_model=None,
+        num_runs=None,
+        no_baseline=False,
+        verbose=False,
+        executor_name=None,
+        artifact_repo="ns/repo",
+        wait=True,
+        jobs_timeout="2h",
+        jobs_flavor="cpu-basic",
+        jobs_secrets=None,
+        jobs_namespace=None,
+        max_parallel=None,
+        log_runs=True,
+        runs_dir=str(config.runs_dir),
+    )
+
+    assert build_calls == ["jobs"]
+    assert calls == [(4, False), (4, False)]
+
+
+@pytest.mark.asyncio
+async def test_eval_cli_execution_options_override_config_defaults(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    skill_record = _write_skill_fixture(tmp_path / "skill")
+    config = Config(
+        runs_dir=tmp_path / "runs",
+        fastagent_config=tmp_path / "fastagent.config.yaml",
+        executor="jobs",
+        num_runs=2,
+        max_parallel=4,
+        jobs_secrets="HF_TOKEN,ANTHROPIC_API_KEY",
+    )
+    fake_executor = object()
+    build_calls: list[str] = []
+    calls: list[tuple[int, bool]] = []
+
+    monkeypatch.setattr("upskill.cli.Config.load", lambda: config)
+
+    def fake_build_executor(name: str, **kwargs: object) -> object:
+        del kwargs
+        build_calls.append(name)
+        return fake_executor
+
+    async def fake_evaluate_skill(*args: object, **kwargs: object) -> EvalResults:
+        del args
+        max_parallel = kwargs["max_parallel"]
+        run_baseline = kwargs["run_baseline"]
+        assert kwargs["executor"] is fake_executor
+        assert isinstance(max_parallel, int)
+        assert isinstance(run_baseline, bool)
+        calls.append((max_parallel, run_baseline))
+        return _make_eval_results(
+            skill=skill_record.skill,
+            model=str(kwargs["model"]),
+            test_cases=skill_record.state.tests,
+            run_baseline=True,
+        )
+
+    monkeypatch.setattr("upskill.cli._build_executor", fake_build_executor)
+    monkeypatch.setattr("upskill.cli.evaluate_skill", fake_evaluate_skill)
+
+    await _eval_async(
+        skill_path=str(tmp_path / "skill"),
+        tests=None,
+        models=["haiku"],
+        test_gen_model=None,
+        num_runs=1,
+        no_baseline=False,
+        verbose=False,
+        executor_name="local",
+        artifact_repo=None,
+        wait=True,
+        jobs_timeout="2h",
+        jobs_flavor="cpu-basic",
+        jobs_secrets="HF_TOKEN",
+        jobs_namespace=None,
+        max_parallel=1,
+        log_runs=True,
+        runs_dir=str(config.runs_dir),
+    )
+
+    assert build_calls == ["local"]
+    assert calls == [(1, True)]
+
+
+@pytest.mark.asyncio
+async def test_eval_cli_jobs_secrets_override_config_defaults(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    skill_record = _write_skill_fixture(tmp_path / "skill")
+    config = Config(
+        runs_dir=tmp_path / "runs",
+        fastagent_config=tmp_path / "fastagent.config.yaml",
+        executor="jobs",
+        jobs_secrets="HF_TOKEN,ANTHROPIC_API_KEY",
+    )
+    fake_executor = object()
+    build_calls: list[str] = []
+
+    monkeypatch.setattr("upskill.cli.Config.load", lambda: config)
+
+    def fake_build_executor(name: str, **kwargs: object) -> object:
+        build_calls.append(name)
+        jobs_config = kwargs["jobs_config"]
+        assert isinstance(jobs_config, JobsConfig)
+        assert jobs_config.jobs_secrets == "HF_TOKEN,OPENAI_API_KEY"
+        return fake_executor
+
+    async def fake_evaluate_skill(*args: object, **kwargs: object) -> EvalResults:
+        del args, kwargs
+        return _make_eval_results(
+            skill=skill_record.skill,
+            model="haiku",
+            test_cases=skill_record.state.tests,
+            run_baseline=True,
+        )
+
+    monkeypatch.setattr("upskill.cli._build_executor", fake_build_executor)
+    monkeypatch.setattr("upskill.cli.evaluate_skill", fake_evaluate_skill)
+
+    await _eval_async(
+        skill_path=str(tmp_path / "skill"),
+        tests=None,
+        models=["haiku"],
+        test_gen_model=None,
+        num_runs=1,
+        no_baseline=False,
+        verbose=False,
+        executor_name="jobs",
+        artifact_repo="ns/repo",
+        wait=True,
+        jobs_timeout="2h",
+        jobs_flavor="cpu-basic",
+        jobs_secrets="HF_TOKEN,OPENAI_API_KEY",
+        jobs_namespace=None,
+        max_parallel=1,
+        log_runs=True,
+        runs_dir=str(config.runs_dir),
+    )
+
+    assert build_calls == ["jobs"]
+
+
+@pytest.mark.asyncio
 async def test_eval_jobs_wait_persists_benchmark_run_summaries(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -154,6 +418,7 @@ async def test_eval_jobs_wait_persists_benchmark_run_summaries(
         del args
         artifact_root = kwargs["artifact_root"]
         assert isinstance(artifact_root, Path)
+        assert kwargs["operation"] == "benchmark"
         max_parallel = kwargs["max_parallel"]
         run_baseline = kwargs["run_baseline"]
         assert isinstance(max_parallel, int)
@@ -205,12 +470,18 @@ async def test_eval_jobs_no_wait_submits_remote_requests(
 ) -> None:
     _write_skill_fixture(tmp_path / "skill")
     config = Config(runs_dir=tmp_path / "runs", fastagent_config=tmp_path / "fastagent.config.yaml")
-    submit_calls: list[tuple[str, bool]] = []
+    submit_calls: list[tuple[str, bool, str]] = []
 
     monkeypatch.setattr("upskill.cli.Config.load", lambda: config)
 
     async def fake_submit_remote_eval_jobs(**kwargs: object) -> list[str]:
-        submit_calls.append((str(kwargs["model"]), bool(kwargs["run_baseline"])))
+        submit_calls.append(
+            (
+                str(kwargs["model"]),
+                bool(kwargs["run_baseline"]),
+                str(kwargs["operation"]),
+            )
+        )
         return ["evalstate/job-1", "evalstate/job-2"]
 
     def fail_build_executor(*args: object, **kwargs: object) -> object:
@@ -245,4 +516,45 @@ async def test_eval_jobs_no_wait_submits_remote_requests(
         runs_dir=str(config.runs_dir),
     )
 
-    assert submit_calls == [("haiku", True)]
+    assert submit_calls == [("haiku", True, "eval")]
+
+
+@pytest.mark.asyncio
+async def test_eval_jobs_wait_fails_cleanly_when_artifact_repo_is_inaccessible(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_skill_fixture(tmp_path / "skill")
+    config = Config(runs_dir=tmp_path / "runs", fastagent_config=tmp_path / "fastagent.config.yaml")
+
+    monkeypatch.setattr("upskill.cli.Config.load", lambda: config)
+    monkeypatch.setattr(
+        "upskill.cli.verify_artifact_repo_access",
+        lambda _repo: (_ for _ in ()).throw(
+            RuntimeError("404 Not Found\nRepository Not Found for url")
+        ),
+    )
+
+    with pytest.raises(click.ClickException, match="Artifact repo is not accessible") as exc_info:
+        await _eval_async(
+            skill_path=str(tmp_path / "skill"),
+            tests=None,
+            models=["haiku"],
+            test_gen_model=None,
+            num_runs=1,
+            no_baseline=False,
+            verbose=False,
+            executor_name="jobs",
+            artifact_repo="evalstate/uskill-test",
+            wait=True,
+            jobs_timeout="2h",
+            jobs_flavor="cpu-basic",
+            jobs_secrets="HF_TOKEN",
+            jobs_namespace=None,
+            max_parallel=3,
+            log_runs=True,
+            runs_dir=str(config.runs_dir),
+        )
+
+    assert "Repo: evalstate/uskill-test" in str(exc_info.value)
+    assert "name is wrong" in str(exc_info.value)

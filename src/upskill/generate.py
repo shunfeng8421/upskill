@@ -137,7 +137,6 @@ async def generate_skill(
 async def generate_tests(
     task: str,
     generator: AgentProtocol,
-    model: str | None = None,
 ) -> list[TestCase]:
     """Generate synthetic test cases from a task description using fast-agent."""
 

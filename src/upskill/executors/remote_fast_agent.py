@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from upskill.artifacts import (
-    bundle_cards,
+    bundle_agent_card,
     copy_config_file,
     ensure_directory,
     materialize_skill_bundle,
@@ -23,6 +23,7 @@ from upskill.hf_jobs import (
     JobsConfig,
     SubmittedJob,
     _make_run_id,
+    _sanitize_hf_job_label_value,
     _submit_bundle_job,
     parse_duration_seconds,
     wait_for_job_outputs,
@@ -170,13 +171,16 @@ class RemoteFastAgentExecutor:
             label=request.label,
             skill=request.skill,
             workspace_files=dict(request.workspace_files),
-            enable_shell=request.enable_shell,
             metadata=dict(request.metadata),
         )
         workspace_dir = ensure_directory(artifact_dir / "workspace")
         materialize_workspace(workspace_dir, normalized_request.workspace_files)
 
-        bundle_cards(normalized_request.cards_source_dir, artifact_dir / "cards")
+        bundle_agent_card(
+            normalized_request.cards_source_dir,
+            artifact_dir / "cards",
+            agent_name=normalized_request.agent,
+        )
         materialize_skill_bundle(artifact_dir / "skills", normalized_request)
         copy_config_file(
             normalized_request.fastagent_config_path,
@@ -194,11 +198,13 @@ class RemoteFastAgentExecutor:
 
     def _submit_bundle(self, request: ExecutionRequest, bundle_archive: Path) -> SubmittedJob:
         run_id = _make_run_id("request", request.model, request.label)
+        labels = self._build_job_labels(request, run_id=run_id)
         submission = _submit_bundle_job(
             bundle_archive=bundle_archive,
             jobs_config=self._jobs_config,
             run_id=run_id,
             model=request.model,
+            labels=labels,
         )
         if self._progress_callback is not None:
             self._progress_callback(
@@ -207,6 +213,26 @@ class RemoteFastAgentExecutor:
             )
         return submission
 
+    def _build_job_labels(self, request: ExecutionRequest, *, run_id: str) -> dict[str, str]:
+        operation = request.metadata.get("operation")
+        labels = {
+            "upskill-agent": _sanitize_hf_job_label_value(request.agent, default="agent"),
+            "upskill-executor": "remote-fast-agent",
+            "upskill-model": _sanitize_hf_job_label_value(request.model, default="model"),
+            "upskill-operation": _sanitize_hf_job_label_value(
+                operation if isinstance(operation, str) else "eval",
+                default="eval",
+            ),
+            "upskill-request": _sanitize_hf_job_label_value(request.label, default="request"),
+            "upskill-run-id": _sanitize_hf_job_label_value(run_id, default="run"),
+        }
+        if request.skill is not None:
+            labels["upskill-skill"] = _sanitize_hf_job_label_value(
+                request.skill.name,
+                default="skill",
+            )
+        return labels
+
     def _create_bundle_archive(self, request: ExecutionRequest) -> tuple[Path, Path]:
         temp_root = Path(tempfile.mkdtemp(prefix="upskill_hf_request_"))
         bundle_root = temp_root / "bundle"
@@ -214,7 +240,11 @@ class RemoteFastAgentExecutor:
         ensure_directory(bundle_root / "skills")
         if request.skill is not None:
             request.skill.save(bundle_root / "skills" / request.skill.name)
-        bundle_cards(request.cards_source_dir, bundle_root / "cards")
+        bundle_agent_card(
+            request.cards_source_dir,
+            bundle_root / "cards",
+            agent_name=request.agent,
+        )
         copy_config_file(request.fastagent_config_path, bundle_root / "fastagent.config.yaml")
         (bundle_root / "agent.txt").write_text(request.agent, encoding="utf-8")
 
@@ -222,10 +252,6 @@ class RemoteFastAgentExecutor:
         (request_dir / "prompt.txt").write_text(request.prompt, encoding="utf-8")
         request_workspace_dir = ensure_directory(request_dir / "workspace")
         materialize_workspace(request_workspace_dir, request.workspace_files)
-        (request_dir / "enable_shell.txt").write_text(
-            "1" if request.enable_shell else "0",
-            encoding="utf-8",
-        )
         (bundle_root / "manifest.json").write_text(
             json.dumps(
                 {
@@ -235,7 +261,6 @@ class RemoteFastAgentExecutor:
                             "id": "request_1",
                             "index": 1,
                             "has_workspace_files": bool(request.workspace_files),
-                            "enable_shell": request.enable_shell,
                         }
                     ],
                 },

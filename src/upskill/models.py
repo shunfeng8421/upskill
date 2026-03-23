@@ -62,6 +62,7 @@ class TestCaseContext(BaseModel):
 class TestCase(BaseModel):
     """A test case for skill evaluation."""
 
+    __test__ = False
     model_config = ConfigDict(extra="forbid")
 
     input: str  # Task/prompt to give the agent
@@ -366,6 +367,7 @@ class ConversationStats(BaseModel):
 class TestResult(BaseModel):
     """Result of running a single test case."""
 
+    __test__ = False
     test_case: TestCase
     success: bool
     output: str | None = None

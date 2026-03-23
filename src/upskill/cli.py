@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
 import json
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import asynccontextmanager
 from importlib import resources
 from pathlib import Path
@@ -25,7 +24,7 @@ from upskill.evaluate import build_eval_requests, evaluate_skill, get_failure_de
 from upskill.executors.local_fast_agent import LocalFastAgentExecutor
 from upskill.executors.remote_fast_agent import RemoteFastAgentExecutor
 from upskill.generate import generate_skill, generate_tests, improve_skill, refine_skill
-from upskill.hf_jobs import JobsConfig
+from upskill.hf_jobs import JobsConfig, verify_artifact_repo_access
 from upskill.logging import (
     aggregate_conversation_stats,
     create_batch_folder,
@@ -37,7 +36,11 @@ from upskill.logging import (
     write_run_metadata,
     write_run_result,
 )
-from upskill.model_resolution import ResolvedModels, resolve_models
+from upskill.model_resolution import (
+    ResolvedModels,
+    build_fastagent_model_references,
+    resolve_models,
+)
 from upskill.models import (
     BatchSummary,
     EvalResults,
@@ -70,6 +73,24 @@ class FastAgentSession(Protocol):
     evaluator: LlmAgent
 
 
+class FastAgentConfig(Protocol):
+    """Typed view of the fast-agent settings object used by upskill."""
+
+    model_references: Mapping[str, Mapping[str, str]]
+
+
+class FastAgentApp(Protocol):
+    """Typed view of the fast-agent app container used by upskill."""
+
+    _config_or_path: FastAgentConfig
+
+
+class FastAgentWithConfig(Protocol):
+    """Typed view of FastAgent for model-reference injection."""
+
+    app: FastAgentApp
+
+
 EvalPlotLabelField = Literal["model", "skill_name"]
 ExecutorName = Literal["local", "jobs"]
 CommandFunction = TypeVar("CommandFunction", bound=Callable[..., object])
@@ -81,45 +102,56 @@ def _jobs_execution_options(
     runs_dir_help: str,
 ) -> Callable[[CommandFunction], CommandFunction]:
     """Attach the shared remote-execution CLI options to a command."""
+    # TODO: add a resumable remote-job collection flow before revisiting the wait-by-default
+    # behavior for generate/eval jobs.
     options = (
         click.option(
             "--executor",
             type=click.Choice(["local", "jobs"]),
-            default="local",
-            show_default=True,
-            help=executor_help,
+            default=None,
+            help=f"{executor_help}. Overrides `executor` in upskill.config.yaml.",
         ),
-        click.option("--artifact-repo", help="Dataset repo for remote fast-agent job artifacts"),
+        click.option(
+            "--artifact-repo",
+            help="Dataset repo for remote job artifacts (required with --executor jobs)",
+        ),
         click.option(
             "--wait/--no-wait",
-            default=False,
-            help="Wait for remote fast-agent jobs and download results",
+            default=True,
+            help="Wait for remote jobs and download results (default: wait)",
         ),
         click.option(
             "--jobs-timeout",
             default="2h",
             show_default=True,
-            help="HF Jobs timeout for remote fast-agent runs",
+            help="HF Jobs timeout for remote runs",
         ),
         click.option(
             "--jobs-flavor",
             default="cpu-basic",
             show_default=True,
-            help="HF Jobs hardware flavor for remote fast-agent runs",
+            help="HF Jobs hardware flavor for remote runs",
         ),
         click.option(
             "--jobs-secrets",
-            default="HF_TOKEN",
-            show_default=True,
-            help="Comma-separated HF Job secrets to forward",
+            default=None,
+            help=(
+                "Comma-separated HF Job secret names to forward (environment variables). Overrides "
+                "`jobs_secrets` in upskill.config.yaml."
+            ),
         ),
-        click.option("--jobs-namespace", help="Optional Hugging Face Jobs namespace"),
+        click.option(
+            "--jobs-namespace",
+            help="Hugging Face Jobs namespace (recommended for remote jobs)",
+        ),
         click.option(
             "--max-parallel",
             type=click.IntRange(min=1),
-            default=5,
-            show_default=True,
-            help="Maximum concurrent evaluation executions per phase",
+            default=None,
+            help=(
+                "Maximum concurrent evaluation executions per phase. Overrides "
+                "`max_parallel` in upskill.config.yaml."
+            ),
         ),
         click.option("--runs-dir", type=click.Path(), help=runs_dir_help),
         click.option(
@@ -137,7 +169,11 @@ def _jobs_execution_options(
 
 
 @asynccontextmanager
-async def _fast_agent_context(config: Config | None = None) -> AsyncIterator[FastAgentSession]:
+async def _fast_agent_context(
+    config: Config | None = None,
+    *,
+    model_references: Mapping[str, Mapping[str, str]] | None = None,
+) -> AsyncIterator[FastAgentSession]:
     config = config or Config.load()
     fast = FastAgent(
         "upskill",
@@ -154,20 +190,34 @@ async def _fast_agent_context(config: Config | None = None) -> AsyncIterator[Fas
     with resources.as_file(cards) as cards_path:
         fast.load_agents(cards_path)
 
+    _install_fast_agent_model_references(
+        cast("FastAgentWithConfig", fast),
+        model_references=model_references,
+    )
+
     async with fast.run() as agent:
         yield cast("FastAgentSession", agent)
 
 
-async def _set_agent_model(agent: object, model: str | None) -> None:
-    """Best-effort model assignment for a fast-agent instance."""
-    if not model:
+def _install_fast_agent_model_references(
+    fast: FastAgentWithConfig,
+    *,
+    model_references: Mapping[str, Mapping[str, str]] | None,
+) -> None:
+    """Merge upskill's model slots into the fast-agent config before agent creation."""
+    if not model_references:
         return
-    set_model = getattr(agent, "set_model", None)
-    if not callable(set_model):
-        return
-    result = set_model(model)
-    if inspect.isawaitable(result):
-        await result
+
+    fast_config = fast.app._config_or_path
+    merged_references = {
+        namespace: dict(entries) for namespace, entries in fast_config.model_references.items()
+    }
+
+    for namespace, entries in model_references.items():
+        namespace_references = merged_references.setdefault(namespace, {})
+        namespace_references.update(entries)
+
+    fast_config.model_references = merged_references
 
 
 def _require_resolved_model(value: str | None, *, field: str, command: str) -> str:
@@ -206,10 +256,42 @@ def _build_executor(
         return LocalFastAgentExecutor()
     if jobs_config is None:
         raise click.ClickException("The jobs executor requires jobs configuration.")
+    _ensure_jobs_artifact_repo_access(jobs_config)
     return RemoteFastAgentExecutor(
         jobs_config=jobs_config,
         progress_callback=progress_callback,
     )
+
+
+def _resolve_executor_name(config: Config, cli_executor_name: ExecutorName | None) -> ExecutorName:
+    """Resolve the effective execution backend from CLI override or config."""
+    return cli_executor_name or config.executor
+
+
+def _resolve_num_runs(
+    config: Config,
+    cli_num_runs: int | None,
+    *,
+    command: Literal["eval", "benchmark"],
+) -> int:
+    """Resolve the effective run count from CLI override or config."""
+    if cli_num_runs is not None:
+        return cli_num_runs
+    return config.effective_num_runs(command)
+
+
+def _resolve_max_parallel(config: Config, cli_max_parallel: int | None) -> int:
+    """Resolve the effective concurrency from CLI override or config."""
+    if cli_max_parallel is not None:
+        return cli_max_parallel
+    return config.max_parallel
+
+
+def _resolve_jobs_secrets(config: Config, cli_jobs_secrets: str | None) -> str:
+    """Resolve the effective HF Jobs secret list from CLI override or config."""
+    if cli_jobs_secrets is not None:
+        return cli_jobs_secrets
+    return config.jobs_secrets
 
 
 def _require_jobs_config(
@@ -221,6 +303,7 @@ def _require_jobs_config(
     jobs_flavor: str,
     jobs_secrets: str,
     jobs_namespace: str | None,
+    jobs_image: str,
 ) -> JobsConfig | None:
     """Build jobs config when the jobs executor is selected."""
     if executor_name != "jobs":
@@ -234,7 +317,25 @@ def _require_jobs_config(
         jobs_flavor=jobs_flavor,
         jobs_secrets=jobs_secrets,
         jobs_namespace=jobs_namespace,
+        jobs_image=jobs_image,
     )
+
+
+def _ensure_jobs_artifact_repo_access(jobs_config: JobsConfig) -> None:
+    """Preflight the jobs artifact repo and surface a CLI-friendly failure."""
+    try:
+        verify_artifact_repo_access(jobs_config.artifact_repo)
+    except RuntimeError as exc:
+        message = (
+            "Artifact repo is not accessible.\n"
+            f"Repo: {jobs_config.artifact_repo}\n"
+            "Create it before submitting jobs and ensure the current Hugging Face "
+            "credentials can access it."
+        )
+        detail = str(exc)
+        if "Repository Not Found" in detail or "404 Not Found" in detail:
+            message += "\nThe dataset repo does not exist or the name is wrong."
+        raise click.ClickException(message) from exc
 
 
 def _print_model_plan(command: str, resolved: ResolvedModels, runs: int | None = None) -> None:
@@ -425,6 +526,7 @@ async def _load_test_cases(
     skill_record: SkillRecord,
     tests_path: str | None,
     test_gen_model: str,
+    model_references: Mapping[str, Mapping[str, str]],
 ) -> tuple[list[TestCase], str]:
     """Load explicit, persisted, or generated test cases for a skill."""
     if tests_path:
@@ -435,13 +537,11 @@ async def _load_test_cases(
     if skill_record.state.tests:
         return skill_record.state.tests, "skill_meta.json"
 
-    async with _fast_agent_context(config) as agent:
-        console.print("Generating test cases from skill...", style="dim")
-        await _set_agent_model(agent.test_gen, test_gen_model)
+    async with _fast_agent_context(config, model_references=model_references) as agent:
+        console.print(f"Generating test cases from skill with {test_gen_model}...", style="dim")
         test_cases = await generate_tests(
             skill_record.skill.description,
             generator=agent.test_gen,
-            model=test_gen_model,
         )
     return test_cases, "generated"
 
@@ -454,6 +554,27 @@ def _count_invalid_expected_cases(test_cases: list[TestCase]) -> int:
         if len(expected_values) < 2:
             invalid_expected += 1
     return invalid_expected
+
+
+def _raise_on_execution_errors(results: EvalResults, *, context: str) -> None:
+    """Raise a CLI-friendly error when evaluation batches contain execution failures."""
+    execution_errors: list[str] = []
+    for phase_label, phase_results in (
+        ("with-skill", results.with_skill_results),
+        ("baseline", results.baseline_results),
+    ):
+        for index, result in enumerate(phase_results, start=1):
+            if result.error is None:
+                continue
+            execution_errors.append(f"{phase_label} test {index}: {result.error}")
+
+    if not execution_errors:
+        return
+
+    preview = "\n".join(f"  - {message}" for message in execution_errors[:3])
+    remaining = len(execution_errors) - 3
+    remainder = f"\n  ... and {remaining} more" if remaining > 0 else ""
+    raise click.ClickException(f"{context} encountered execution errors:\n{preview}{remainder}")
 
 
 def _load_trace_context(trace_path: Path) -> str:
@@ -479,8 +600,6 @@ async def _create_generate_skill_record(
     skill_gen_model: str,
 ) -> tuple[SkillRecord, str]:
     """Create or improve the skill record used by ``generate``."""
-    await _set_agent_model(agent.skill_gen, skill_gen_model)
-
     if from_trace:
         trace_path = Path(from_trace)
         console.print(f"Generating skill from trace: {from_trace}", style="dim")
@@ -536,8 +655,10 @@ async def _submit_remote_eval_jobs(
     cards_path: Path,
     artifact_root: Path,
     run_baseline: bool,
+    operation: str,
 ) -> list[str]:
     """Submit remote fast-agent requests for an evaluation batch."""
+    _ensure_jobs_artifact_repo_access(jobs_config)
     remote_executor = RemoteFastAgentExecutor(
         jobs_config=jobs_config,
         progress_callback=_print_eval_progress,
@@ -550,6 +671,7 @@ async def _submit_remote_eval_jobs(
         cards_source_dir=cards_path,
         artifact_root=artifact_root,
         run_baseline=run_baseline,
+        operation=operation,
     )
     job_refs: list[str] = []
     for pending_request in requests:
@@ -578,6 +700,7 @@ async def _submit_generate_jobs_eval(
         cards_path=cards_path,
         artifact_root=batch_folder / "remote_downloads" / "attempt_1",
         run_baseline=True,
+        operation="generate",
     )
 
 
@@ -615,10 +738,11 @@ async def _run_generate_refinement_loop(
             fastagent_config_path=config.effective_fastagent_config,
             cards_source_dir=cards_path,
             artifact_root=batch_folder / f"attempt_{attempt_number}",
-            show_baseline_progress=False,
             max_parallel=max_parallel,
             progress_callback=_print_eval_progress,
+            operation="generate",
         )
+        _raise_on_execution_errors(results, context="Generate refinement")
 
         if log_runs:
             run_results.extend(
@@ -661,7 +785,6 @@ async def _run_generate_refinement_loop(
 
         console.print("Refining...", style="dim")
         failures = get_failure_descriptions(results)
-        await _set_agent_model(agent.skill_gen, skill_gen_model)
         skill_record = await refine_skill(
             skill_record,
             failures,
@@ -697,10 +820,11 @@ async def _run_generate_extra_eval(
         fastagent_config_path=config.effective_fastagent_config,
         cards_source_dir=cards_path,
         artifact_root=batch_folder / f"eval_{model}",
-        show_baseline_progress=False,
         max_parallel=max_parallel,
         progress_callback=_print_eval_progress,
+        operation="generate",
     )
+    _raise_on_execution_errors(results, context=f"Generate eval on {model}")
 
     run_results: list[RunResult] = []
     if log_runs:
@@ -762,7 +886,9 @@ async def _run_with_skill_benchmark(
                 run_baseline=False,
                 max_parallel=max_parallel,
                 progress_callback=_print_eval_progress if verbose else None,
+                operation="benchmark",
             )
+            _raise_on_execution_errors(results, context=f"Benchmark run on {model}")
             run_result = _build_logged_run_result(
                 model=model,
                 task=skill.description,
@@ -911,7 +1037,6 @@ def main():
 @main.command()
 @click.argument("task")
 @click.option("-e", "--example", multiple=True, help="Input -> output example")
-@click.option("--tool", help="Generate from MCP tool schema (path#tool_name)")
 @click.option(
     "-f",
     "--from",
@@ -938,21 +1063,20 @@ def main():
 def generate(
     task: str,
     example: tuple[str, ...],
-    tool: str | None,
     from_source: str | None,
     model: str | None,
     test_gen_model: str | None,
     output: str | None,
     no_eval: bool,
     eval_model: str | None,
-    executor: ExecutorName,
+    executor: ExecutorName | None,
     artifact_repo: str | None,
     wait: bool,
     jobs_timeout: str,
     jobs_flavor: str,
-    jobs_secrets: str,
+    jobs_secrets: str | None,
     jobs_namespace: str | None,
-    max_parallel: int,
+    max_parallel: int | None,
     runs_dir: str | None,
     log_runs: bool,
 ):
@@ -970,6 +1094,10 @@ def generate(
 
         upskill generate "validate forms" -o ./my-skills/validation
 
+        # Remote execution on Hugging Face Jobs:
+
+        upskill generate "parse invoices" --executor jobs --artifact-repo <user>/upskill-tests
+
         # Improve an existing skill (auto-detects directory):
 
         upskill generate "add more error handling examples" --from ./skills/api-errors/
@@ -986,8 +1114,6 @@ def generate(
 
         upskill generate "document code" --no-log-runs
     """
-    del tool
-
     # Auto-detect if --from is a skill directory or trace file
     from_skill = None
     from_trace = None
@@ -1033,19 +1159,22 @@ async def _generate_async(
     output: str | None,
     no_eval: bool,
     eval_model: str | None,
-    executor_name: ExecutorName,
+    executor_name: ExecutorName | None,
     artifact_repo: str | None,
     wait: bool,
     jobs_timeout: str,
     jobs_flavor: str,
-    jobs_secrets: str,
+    jobs_secrets: str | None,
     jobs_namespace: str | None,
-    max_parallel: int,
+    max_parallel: int | None,
     runs_dir: str | None,
     log_runs: bool,
 ):
     """Async implementation of generate command."""
     config = Config.load()
+    executor_name = _resolve_executor_name(config, executor_name)
+    max_parallel = _resolve_max_parallel(config, max_parallel)
+    jobs_secrets = _resolve_jobs_secrets(config, jobs_secrets)
     jobs_config = _require_jobs_config(
         executor_name=executor_name,
         artifact_repo=artifact_repo,
@@ -1054,6 +1183,7 @@ async def _generate_async(
         jobs_flavor=jobs_flavor,
         jobs_secrets=jobs_secrets,
         jobs_namespace=jobs_namespace,
+        jobs_image=config.jobs_image,
     )
     resolved = resolve_models(
         "generate",
@@ -1073,6 +1203,7 @@ async def _generate_async(
         command="generate",
     )
     extra_eval_model = resolved.extra_eval_model
+    model_references = build_fastagent_model_references(config=config, resolved=resolved)
 
     _print_model_plan("generate", resolved)
 
@@ -1084,7 +1215,7 @@ async def _generate_async(
     if log_runs:
         console.print(f"Logging runs to: {batch_folder}", style="dim")
 
-    async with _fast_agent_context(config) as agent:
+    async with _fast_agent_context(config, model_references=model_references) as agent:
         cards = resources.files("upskill").joinpath("agent_cards")
         with resources.as_file(cards) as cards_path:
             skill_record, eval_task = await _create_generate_skill_record(
@@ -1096,12 +1227,10 @@ async def _generate_async(
                 skill_gen_model=skill_gen_model,
             )
 
-            console.print("Generating test cases...", style="dim")
-            await _set_agent_model(agent.test_gen, test_gen_model)
+            console.print(f"Generating test cases with {test_gen_model}...", style="dim")
             test_cases = await generate_tests(
                 eval_task,
                 generator=agent.test_gen,
-                model=test_gen_model,
             )
             skill_record.state.tests = list(test_cases)
 
@@ -1300,7 +1429,13 @@ def _save_and_display(
     "--test-gen-model",
     help="Override test generation model when tests must be generated",
 )
-@click.option("--runs", "num_runs", type=int, default=1, help="Number of runs per model")
+@click.option(
+    "--runs",
+    "num_runs",
+    type=click.IntRange(min=1),
+    default=None,
+    help="Number of runs per model. Overrides `num_runs` in upskill.config.yaml.",
+)
 @click.option(
     "--no-baseline",
     is_flag=True,
@@ -1316,17 +1451,17 @@ def eval_cmd(
     tests: str | None,
     models: tuple[str, ...],
     test_gen_model: str | None,
-    num_runs: int,
+    num_runs: int | None,
     no_baseline: bool,
     verbose: bool,
-    executor: ExecutorName,
+    executor: ExecutorName | None,
     artifact_repo: str | None,
     wait: bool,
     jobs_timeout: str,
     jobs_flavor: str,
-    jobs_secrets: str,
+    jobs_secrets: str | None,
     jobs_namespace: str | None,
-    max_parallel: int,
+    max_parallel: int | None,
     log_runs: bool,
     runs_dir: str | None,
 ):
@@ -1383,22 +1518,26 @@ async def _eval_async(  # noqa: C901
     tests: str | None,
     models: list[str] | None,
     test_gen_model: str | None,
-    num_runs: int,
+    num_runs: int | None,
     no_baseline: bool,
     verbose: bool,
-    executor_name: ExecutorName,
+    executor_name: ExecutorName | None,
     artifact_repo: str | None,
     wait: bool,
     jobs_timeout: str,
     jobs_flavor: str,
-    jobs_secrets: str,
+    jobs_secrets: str | None,
     jobs_namespace: str | None,
-    max_parallel: int,
+    max_parallel: int | None,
     log_runs: bool,
     runs_dir: str | None,
 ):
     """Async implementation of eval command."""
     config = Config.load()
+    executor_name = _resolve_executor_name(config, executor_name)
+    num_runs = _resolve_num_runs(config, num_runs, command="eval")
+    max_parallel = _resolve_max_parallel(config, max_parallel)
+    jobs_secrets = _resolve_jobs_secrets(config, jobs_secrets)
     jobs_config = _require_jobs_config(
         executor_name=executor_name,
         artifact_repo=artifact_repo,
@@ -1407,6 +1546,7 @@ async def _eval_async(  # noqa: C901
         jobs_flavor=jobs_flavor,
         jobs_secrets=jobs_secrets,
         jobs_namespace=jobs_namespace,
+        jobs_image=config.jobs_image,
     )
     executor = None
     if executor_name == "local" or wait:
@@ -1433,6 +1573,7 @@ async def _eval_async(  # noqa: C901
         field="test_generation_model",
         command="eval",
     )
+    model_references = build_fastagent_model_references(config=config, resolved=resolved)
 
     _print_model_plan("eval", resolved, runs=num_runs)
     if resolved.is_benchmark_mode and no_baseline:
@@ -1454,6 +1595,7 @@ async def _eval_async(  # noqa: C901
         skill_record=skill_record,
         tests_path=tests,
         test_gen_model=test_gen_model,
+        model_references=model_references,
     )
 
     invalid_expected = _count_invalid_expected_cases(test_cases)
@@ -1490,6 +1632,7 @@ async def _eval_async(  # noqa: C901
                             / model
                             / f"run_{run_num}",
                             run_baseline=False,
+                            operation="benchmark",
                         )
                         submitted_job_refs.extend(job_refs)
                         console.print(f"Remote fast-agent job id(s): {', '.join(job_refs)}")
@@ -1507,6 +1650,7 @@ async def _eval_async(  # noqa: C901
                 cards_path=cards_path,
                 artifact_root=batch_folder / "remote_downloads",
                 run_baseline=resolved.run_baseline,
+                operation="eval",
             )
         console.print(f"Remote fast-agent job id(s): {', '.join(job_refs)}")
         return
@@ -1559,10 +1703,11 @@ async def _eval_async(  # noqa: C901
                 cards_source_dir=cards_path,
                 artifact_root=batch_folder / "eval",
                 run_baseline=resolved.run_baseline,
-                show_baseline_progress=verbose,
                 max_parallel=max_parallel,
                 progress_callback=_print_eval_progress,
+                operation="eval",
             )
+            _raise_on_execution_errors(results, context=f"Evaluation on {model}")
 
             # Log results (both baseline and with-skill)
             run_results: list[RunResult] = []
@@ -1737,7 +1882,13 @@ def list_cmd(skills_dir: str | None, verbose: bool):
     required=True,
     help="Evaluation model(s) to benchmark (repeatable)",
 )
-@click.option("--runs", "num_runs", type=int, default=3, help="Runs per model (default: 3)")
+@click.option(
+    "--runs",
+    "num_runs",
+    type=click.IntRange(min=1),
+    default=None,
+    help="Runs per model. Overrides `num_runs` in upskill.config.yaml.",
+)
 @click.option("-t", "--tests", type=click.Path(exists=True), help="Test cases JSON file")
 @click.option(
     "--test-gen-model",
@@ -1746,9 +1897,8 @@ def list_cmd(skills_dir: str | None, verbose: bool):
 @click.option(
     "--executor",
     type=click.Choice(["local", "jobs"]),
-    default="local",
-    show_default=True,
-    help="Execution backend for benchmark runs",
+    default=None,
+    help="Execution backend for benchmark runs. Overrides `executor` in upskill.config.yaml.",
 )
 @click.option("--artifact-repo", help="Dataset repo for remote fast-agent job artifacts")
 @click.option(
@@ -1768,9 +1918,11 @@ def list_cmd(skills_dir: str | None, verbose: bool):
 )
 @click.option(
     "--jobs-secrets",
-    default="HF_TOKEN",
-    show_default=True,
-    help="Comma-separated HF Job secrets to forward",
+    default=None,
+    help=(
+        "Comma-separated HF Job secret names to forward. Overrides "
+        "`jobs_secrets` in upskill.config.yaml."
+    ),
 )
 @click.option("--jobs-namespace", help="Optional Hugging Face Jobs namespace")
 @click.option("-o", "--output", type=click.Path(), help="Output directory for results")
@@ -1778,26 +1930,28 @@ def list_cmd(skills_dir: str | None, verbose: bool):
 @click.option(
     "--max-parallel",
     type=click.IntRange(min=1),
-    default=5,
-    show_default=True,
-    help="Maximum concurrent evaluation executions per phase",
+    default=None,
+    help=(
+        "Maximum concurrent evaluation executions per phase. Overrides "
+        "`max_parallel` in upskill.config.yaml."
+    ),
 )
 def benchmark_cmd(
     skill_path: str,
     models: tuple[str, ...],
-    num_runs: int,
+    num_runs: int | None,
     tests: str | None,
     test_gen_model: str | None,
-    executor: ExecutorName,
+    executor: ExecutorName | None,
     artifact_repo: str | None,
     wait: bool,
     jobs_timeout: str,
     jobs_flavor: str,
-    jobs_secrets: str,
+    jobs_secrets: str | None,
     jobs_namespace: str | None,
     output: str | None,
     verbose: bool,
-    max_parallel: int,
+    max_parallel: int | None,
 ):
     """Benchmark a skill across multiple models.
 
@@ -1840,21 +1994,25 @@ async def _benchmark_async(
     skill_path: str,
     models: list[str],
     test_gen_model: str | None,
-    num_runs: int,
+    num_runs: int | None,
     tests_path: str | None,
-    executor_name: ExecutorName,
+    executor_name: ExecutorName | None,
     artifact_repo: str | None,
     wait: bool,
     jobs_timeout: str,
     jobs_flavor: str,
-    jobs_secrets: str,
+    jobs_secrets: str | None,
     jobs_namespace: str | None,
     output_dir: str | None,
     verbose: bool,
-    max_parallel: int,
+    max_parallel: int | None,
 ):
     """Async implementation of benchmark command."""
     config = Config.load()
+    executor_name = _resolve_executor_name(config, executor_name)
+    num_runs = _resolve_num_runs(config, num_runs, command="benchmark")
+    max_parallel = _resolve_max_parallel(config, max_parallel)
+    jobs_secrets = _resolve_jobs_secrets(config, jobs_secrets)
     jobs_config = _require_jobs_config(
         executor_name=executor_name,
         artifact_repo=artifact_repo,
@@ -1863,6 +2021,7 @@ async def _benchmark_async(
         jobs_flavor=jobs_flavor,
         jobs_secrets=jobs_secrets,
         jobs_namespace=jobs_namespace,
+        jobs_image=config.jobs_image,
     )
     if executor_name == "jobs" and not wait:
         raise click.ClickException(
@@ -1891,6 +2050,7 @@ async def _benchmark_async(
         field="test_generation_model",
         command="benchmark",
     )
+    model_references = build_fastagent_model_references(config=config, resolved=resolved)
 
     _print_model_plan("benchmark", resolved, runs=num_runs)
 
@@ -1904,6 +2064,7 @@ async def _benchmark_async(
             skill_record=skill_record,
             tests_path=tests_path,
             test_gen_model=test_gen_model,
+            model_references=model_references,
         )
 
         # Setup output directory

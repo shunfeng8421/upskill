@@ -8,26 +8,11 @@
 # Local models: generic.<model_name> (e.g., generic.llama3.2:latest)
 #default_model: kimi
 
-# Generic provider for local OpenAI-compatible endpoints (Ollama, llama.cpp, etc.)
-# Override with GENERIC_BASE_URL and GENERIC_API_KEY environment variables
-generic:
-  api_key: "local"
-  base_url: "http://localhost:11434/v1"
-
-# MCP timeline display settings
-mcp_timeline:
-  steps: 20
-  step_seconds: 15
-
-# Shell execution settings
-shell_execution:
-  show_bash: true
-
 # Logging and Console Configuration
 logger:
-  progress_display: true
-  show_chat: true
-  show_tools: true
+  progress_display: false
+  show_chat: false
+  show_tools: false
   truncate_tools: true
   streaming: markdown
 

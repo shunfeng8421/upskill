@@ -13,6 +13,13 @@ if TYPE_CHECKING:
     from upskill.executors.contracts import ExecutionRequest
 
 _NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
+_AGENT_CARD_FILE_EXTENSIONS = {
+    ".json",
+    ".markdown",
+    ".md",
+    ".yaml",
+    ".yml",
+}
 
 
 def sanitize_artifact_name(value: str) -> str:
@@ -57,6 +64,45 @@ def bundle_cards(
     return destination_dir
 
 
+def bundle_agent_card(
+    source_dir: Path,
+    destination_dir: Path,
+    *,
+    agent_name: str,
+) -> Path:
+    """Copy only the selected agent card plus shared non-card resources."""
+    if destination_dir.exists():
+        shutil.rmtree(destination_dir)
+    ensure_directory(destination_dir)
+
+    if source_dir.is_file():
+        if source_dir.stem != agent_name:
+            raise FileNotFoundError(
+                f"Requested agent card {agent_name!r} does not match source file {source_dir.name!r}."
+            )
+        shutil.copy2(source_dir, destination_dir / source_dir.name)
+        return destination_dir
+
+    matched_card = False
+    for item in source_dir.iterdir():
+        destination = destination_dir / item.name
+        if item.is_dir():
+            shutil.copytree(item, destination)
+            continue
+        if item.stem == agent_name and item.suffix in _AGENT_CARD_FILE_EXTENSIONS:
+            shutil.copy2(item, destination)
+            matched_card = True
+            continue
+        if item.suffix not in _AGENT_CARD_FILE_EXTENSIONS:
+            shutil.copy2(item, destination)
+
+    if not matched_card:
+        raise FileNotFoundError(
+            f"Could not find an agent card named {agent_name!r} in {source_dir}."
+        )
+    return destination_dir
+
+
 def materialize_skill_bundle(
     destination_dir: Path,
     request: ExecutionRequest,
@@ -76,14 +122,11 @@ def write_request_file(path: Path, request: ExecutionRequest) -> None:
     path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
 
 
-def copy_config_file(source: Path, destination: Path) -> Path:
-    """Preserve the fast-agent config used for a run."""
+def copy_config_file(source: Path, destination: Path) -> Path | None:
+    """Preserve the fast-agent config used for a run when one exists."""
+    if not source.exists():
+        return None
+
     destination.parent.mkdir(parents=True, exist_ok=True)
-    if source.exists():
-        shutil.copy2(source, destination)
-    else:
-        destination.write_text(
-            f"# Config file was not present at execution time: {source}\n",
-            encoding="utf-8",
-        )
+    shutil.copy2(source, destination)
     return destination

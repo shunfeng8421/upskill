@@ -26,6 +26,26 @@ class ResolvedModels:
     run_baseline: bool = True
 
 
+def build_fastagent_model_references(
+    *,
+    config: Config,
+    resolved: ResolvedModels,
+) -> dict[str, dict[str, str]]:
+    """Build fast-agent model references for the standard upskill card slots."""
+
+    skill_generation_model = resolved.skill_generation_model or config.skill_generation_model
+    test_generation_model = (
+        resolved.test_generation_model or config.test_gen_model or skill_generation_model
+    )
+    return {
+        "system": {
+            "default": skill_generation_model,
+            "skill_gen": skill_generation_model,
+            "test_gen": test_generation_model,
+        }
+    }
+
+
 def resolve_models(
     command: CommandName,
     *,

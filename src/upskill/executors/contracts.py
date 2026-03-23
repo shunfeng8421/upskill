@@ -27,7 +27,6 @@ class ExecutionRequest:
     label: str
     skill: Skill | None = None
     workspace_files: dict[str, str] = field(default_factory=dict)
-    enable_shell: bool = False
     metadata: dict[str, ExecutionMetadataValue] = field(default_factory=dict)
 
 

@@ -38,6 +38,21 @@ class PendingEvaluationRequest:
     request: ExecutionRequest
 
 
+def _format_execution_error(
+    error: str,
+    *,
+    metadata: dict[str, str | int | float | bool | None] | None,
+) -> str:
+    """Append useful execution identifiers to surfaced backend errors."""
+    if metadata is None:
+        return error
+
+    job_id = metadata.get("job_id")
+    if isinstance(job_id, str) and job_id:
+        return f"{error} (job {job_id})"
+    return error
+
+
 def _write_test_result_summary(path: Path, result: TestResult) -> None:
     """Persist a per-test result summary alongside raw artifacts."""
     path.write_text(
@@ -180,6 +195,7 @@ def build_eval_execution_request(
     artifact_dir: Path,
     agent_name: str = "evaluator",
     instance_name: str | None = None,
+    operation: str = "eval",
 ) -> ExecutionRequest:
     """Build the normalized execution request for a single evaluation test."""
     workspace_files = (
@@ -196,9 +212,9 @@ def build_eval_execution_request(
         label=instance_name or (skill.name if skill else "baseline"),
         skill=skill,
         workspace_files=workspace_files,
-        enable_shell=bool(workspace_files or test_case.validator or test_case.output_file),
         metadata={
             "instance_name": instance_name,
+            "operation": operation,
             "skill_name": skill.name if skill else None,
             "has_validator": bool(test_case.validator),
         },
@@ -214,6 +230,7 @@ def build_eval_requests(
     cards_source_dir: Path,
     artifact_root: Path,
     run_baseline: bool = True,
+    operation: str = "eval",
 ) -> list[PendingEvaluationRequest]:
     """Build all execution requests needed for an evaluation run."""
     requests: list[PendingEvaluationRequest] = []
@@ -234,6 +251,7 @@ def build_eval_requests(
                         cards_source_dir=cards_source_dir,
                         artifact_dir=batch_root / f"test_{index}",
                         instance_name=instance_name,
+                        operation=operation,
                     ),
                 )
             )
@@ -262,6 +280,7 @@ async def _run_test_with_evaluator(
     artifact_dir: Path,
     agent_name: str = "evaluator",
     instance_name: str | None = None,
+    operation: str = "eval",
 ) -> TestResult:
     """Run a single test case through the configured executor."""
     request = build_eval_execution_request(
@@ -273,6 +292,7 @@ async def _run_test_with_evaluator(
         artifact_dir=artifact_dir,
         agent_name=agent_name,
         instance_name=instance_name,
+        operation=operation,
     )
     normalized_artifact_dir = request.artifact_dir
 
@@ -292,7 +312,10 @@ async def _run_test_with_evaluator(
             output=execution_result.output_text,
             tokens_used=execution_result.stats.total_tokens,
             turns=execution_result.stats.turns,
-            error=execution_result.error,
+            error=_format_execution_error(
+                execution_result.error,
+                metadata=execution_result.metadata,
+            ),
             stats=execution_result.stats,
         )
         _write_test_result_summary(normalized_artifact_dir / "test_result.json", result)
@@ -327,6 +350,7 @@ async def run_test(
     cards_source_dir: Path,
     artifact_dir: Path,
     instance_name: str | None = None,
+    operation: str = "eval",
 ) -> TestResult:
     """Run a single test case via the execution backend.
 
@@ -339,6 +363,7 @@ async def run_test(
         cards_source_dir: Source directory for bundled agent cards
         artifact_dir: Output directory for raw execution artifacts
         instance_name: Optional evaluator instance display name
+        operation: High-level command family for labeling submitted jobs
     """
     return await _run_test_with_evaluator(
         test_case,
@@ -349,6 +374,7 @@ async def run_test(
         cards_source_dir=cards_source_dir,
         artifact_dir=artifact_dir,
         instance_name=instance_name,
+        operation=operation,
     )
 
 
@@ -362,9 +388,9 @@ async def evaluate_skill(
     cards_source_dir: Path,
     artifact_root: Path,
     run_baseline: bool = True,
-    show_baseline_progress: bool = False,
     max_parallel: int = 5,
     progress_callback: Callable[[str], None] | None = None,
+    operation: str = "eval",
 ) -> EvalResults:
     """Evaluate a skill against test cases using FastAgent.
 
@@ -377,15 +403,13 @@ async def evaluate_skill(
         cards_source_dir: Source directory for evaluator cards
         artifact_root: Artifact root for preserved raw execution outputs
         run_baseline: Whether to also run without the skill
-        show_baseline_progress: Whether to render baseline progress output
         max_parallel: Maximum number of concurrent test executions
         progress_callback: Optional callback for lightweight progress updates
+        operation: High-level command family for labeling submitted jobs
 
     Returns:
         EvalResults comparing skill vs baseline
     """
-    del show_baseline_progress
-
     results = EvalResults(skill_name=skill.name, model=model)
     semaphore = asyncio.Semaphore(max_parallel)
     ensure_directory(artifact_root)
@@ -411,6 +435,7 @@ async def evaluate_skill(
                     cards_source_dir=cards_source_dir,
                     artifact_dir=test_artifact_dir,
                     instance_name=instance_name,
+                    operation=operation,
                 )
             if progress_callback is not None:
                 status = "ok" if result.success else "failed"

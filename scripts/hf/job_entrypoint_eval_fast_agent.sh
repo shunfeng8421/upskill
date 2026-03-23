@@ -26,8 +26,6 @@ for request_dir in "$BUNDLE_DIR"/requests/*; do
   request_id="$(basename "$request_dir")"
   prompt_path="$request_dir/prompt.txt"
   workspace_src="$request_dir/workspace"
-  shell_flag="$(cat "$request_dir/enable_shell.txt" 2>/dev/null || echo 0)"
-  prompt_text="$(cat "$prompt_path")"
 
   workspace_tmp="$(mktemp -d)"
   if [[ -d "$workspace_src" ]]; then
@@ -37,10 +35,7 @@ for request_dir in "$BUNDLE_DIR"/requests/*; do
     cp -f "$BUNDLE_DIR/fastagent.config.yaml" "$workspace_tmp/fastagent.config.yaml"
   fi
 
-  cmd=("${COMMON[@]}" --model "$FAST_MODEL" --message "$prompt_text" --results "$OUT_DIR/results/$request_id.json")
-  if [[ "$shell_flag" == "1" ]]; then
-    cmd+=(--shell)
-  fi
+  cmd=("${COMMON[@]}" --model "$FAST_MODEL" --prompt-file "$prompt_path" --results "$OUT_DIR/results/$request_id.json")
 
   printf '%s\n' "${cmd[*]}" > "$OUT_DIR/logs/$request_id.command.txt"
 
