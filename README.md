@@ -4,6 +4,12 @@
 
 Generate and evaluate agent skills based on traces with agents. Create skills with teacher models (expensive/slow) that student models (cheap/fast) can use to perform harder tasks reliably.
 
+
+> [!TIP] 
+> 
+> UPskill v2 - recommended default config file now runs evaluations on Hugging Face Jobs. Make sure
+> to set your `HF_TOKEN` and use `--artifact-repo <dataset-name>` for job creation and result capture  
+
 ## Quick Start
 
 Install upskill:
