@@ -149,6 +149,8 @@ async def generate_tests(
     cases = result.cases
     invalid_expected = 0
     for tc in cases:
+        if tc.expected is None:
+            continue
         expected_values = [value.strip() for value in tc.expected.contains if value.strip()]
         if len(expected_values) < 2:
             invalid_expected += 1
@@ -160,8 +162,8 @@ async def generate_tests(
     )
     if invalid_expected:
         print(
-            "Warning: some test cases are missing at least two expected strings; "
-            "review generated tests."
+            "Warning: some legacy expected-string test cases are missing at least two expected "
+            "strings; review generated tests."
         )
     return cases
 

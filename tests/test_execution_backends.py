@@ -19,7 +19,14 @@ from upskill.executors.local_fast_agent import LocalFastAgentExecutor
 from upskill.executors.remote_fast_agent import RemoteFastAgentExecutor
 from upskill.fast_agent_cli import build_fast_agent_command
 from upskill.hf_jobs import JobsConfig, SubmittedJob
-from upskill.models import ConversationStats, ExpectedSpec, Skill, TestCase, TestResult
+from upskill.models import (
+    ConversationStats,
+    ExpectedSpec,
+    Skill,
+    TestCase,
+    TestResult,
+    VerifierSpec,
+)
 from upskill.result_parsing import parse_fast_agent_results
 
 
@@ -511,6 +518,66 @@ async def test_evaluate_skill_emits_per_test_progress_messages(tmp_path: Path) -
     assert results.with_skill_success_rate == 1.0
     assert "starting with-skill test 1/1" in messages
     assert "finished with-skill test 1/1 (ok)" in messages
+
+
+@pytest.mark.asyncio
+async def test_evaluate_skill_supports_verifier_only_test_cases(tmp_path: Path) -> None:
+    skill = Skill(
+        name="write-good-prs",
+        description="Write good pull request descriptions.",
+        body="Use a clear structure.",
+    )
+    test_case = TestCase(
+        input="write a report",
+        verifiers=[
+            VerifierSpec(type="file_exists", path="report.txt"),
+            VerifierSpec(type="file_contains", path="report.txt", text="answer"),
+        ],
+    )
+
+    class FakeExecutor:
+        async def execute(self, request: ExecutionRequest) -> ExecutionHandle:
+            request.artifact_dir.mkdir(parents=True, exist_ok=True)
+            workspace_dir = request.artifact_dir / "workspace"
+            workspace_dir.mkdir(parents=True, exist_ok=True)
+            (workspace_dir / "report.txt").write_text("answer in report", encoding="utf-8")
+            task = asyncio.create_task(
+                asyncio.sleep(
+                    0,
+                    result=ExecutionResult(
+                        output_text="done",
+                        raw_results_path=None,
+                        stdout_path=request.artifact_dir / "stdout.txt",
+                        stderr_path=request.artifact_dir / "stderr.txt",
+                        artifact_dir=request.artifact_dir,
+                        workspace_dir=workspace_dir,
+                        stats=ConversationStats(),
+                    ),
+                )
+            )
+            return ExecutionHandle(request=request, task=task)
+
+        async def collect(self, handle: ExecutionHandle) -> ExecutionResult:
+            return await handle.task
+
+        async def cancel(self, handle: ExecutionHandle) -> None:
+            handle.task.cancel()
+
+    results = await evaluate_skill(
+        skill,
+        [test_case],
+        FakeExecutor(),
+        model="haiku",
+        fastagent_config_path=tmp_path / "fastagent.config.yaml",
+        cards_source_dir=tmp_path,
+        artifact_root=tmp_path / "eval",
+    )
+
+    test_result = results.with_skill_results[0]
+    assert test_result.success is True
+    assert test_result.validation_result is not None
+    assert test_result.validation_result.assertions_passed == 2
+    assert test_result.validation_result.assertions_total == 2
 
 
 @pytest.mark.asyncio
