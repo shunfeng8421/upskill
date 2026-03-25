@@ -547,9 +547,11 @@ async def _load_test_cases(
 
 
 def _count_invalid_expected_cases(test_cases: list[TestCase]) -> int:
-    """Count generated or loaded tests missing enough expected strings."""
+    """Count tests with legacy expected-string checks missing enough values."""
     invalid_expected = 0
     for test_case in test_cases:
+        if test_case.expected is None:
+            continue
         expected_values = [value.strip() for value in test_case.expected.contains if value.strip()]
         if len(expected_values) < 2:
             invalid_expected += 1
@@ -1601,7 +1603,11 @@ async def _eval_async(  # noqa: C901
     invalid_expected = _count_invalid_expected_cases(test_cases)
     console.print(f"[dim]Loaded {len(test_cases)} test case(s) from {test_source}[/dim]")
     if invalid_expected:
-        console.print(f"[yellow]{invalid_expected} test case(s) missing expected strings[/yellow]")
+        console.print(
+            "[yellow]"
+            f"{invalid_expected} legacy expected-string test case(s) missing expected strings"
+            "[/yellow]"
+        )
 
     runs_path = Path(runs_dir) if runs_dir else config.runs_dir
     batch_id, batch_folder = create_batch_folder(runs_path)

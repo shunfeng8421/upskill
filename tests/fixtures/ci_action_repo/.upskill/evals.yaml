@@ -1,0 +1,5 @@
+scenarios:
+  - id: fixture-scenario
+    skills:
+      - skills/example-skill
+    tests: evals/example.yaml

@@ -5,9 +5,9 @@ from __future__ import annotations
 import json
 import re
 from datetime import datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -34,6 +34,33 @@ class ValidationResult(BaseModel):
     metrics_count: int = 0
     benchmarks_found: list[str] = Field(default_factory=list)
     error_message: str | None = None
+    details: list[str] = Field(default_factory=list)
+
+
+type VerifierConfigValue = str | int | float | bool
+
+
+class VerifierSpec(BaseModel):
+    """Deterministic verifier configuration for a test case."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: str
+    name: str | None = None
+    values: list[str] = Field(default_factory=list)
+    path: str | None = None
+    text: str | None = None
+    cmd: str | None = None
+    config: dict[str, VerifierConfigValue] | None = None
+
+    @field_validator("values", mode="before")
+    @classmethod
+    def coerce_values(cls, value: str | list[str] | None) -> list[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            return [value]
+        return value
 
 
 class ExpectedSpec(BaseModel):
@@ -67,12 +94,38 @@ class TestCase(BaseModel):
 
     input: str  # Task/prompt to give the agent
     context: TestCaseContext | None = None  # Files, env vars, etc.
-    expected: ExpectedSpec  # Expected output checks
+    expected: ExpectedSpec | None = None  # Legacy expected output checks
+    verifiers: list[VerifierSpec] = Field(default_factory=list)
 
     # Custom validator support
     output_file: str | None = None  # File to validate instead of agent output
     validator: str | None = None  # Validator name (e.g., "hf_eval_yaml")
-    validator_config: dict[str, str | int | float | bool] | None = None
+    validator_config: dict[str, VerifierConfigValue] | None = None
+
+    @model_validator(mode="after")
+    def validate_expectations(self) -> TestCase:
+        if self.expected is None and not self.verifiers and self.validator is None:
+            raise ValueError("TestCase requires at least one of expected, verifiers, or validator.")
+        return self
+
+    def effective_verifiers(self) -> list[VerifierSpec]:
+        """Return normalized verifier specs including legacy expectation fields."""
+        effective = list(self.verifiers)
+        if self.expected is not None and self.expected.contains:
+            effective.insert(
+                0,
+                VerifierSpec(type="contains", values=self.expected.contains),
+            )
+        if self.validator is not None:
+            effective.append(
+                VerifierSpec(
+                    type="validator",
+                    name=self.validator,
+                    path=self.output_file,
+                    config=self.validator_config,
+                )
+            )
+        return effective
 
 
 class TestCaseSuite(BaseModel):
@@ -415,6 +468,88 @@ class EvalResults(BaseModel):
         """Skill provides net benefit."""
         # Beneficial if: better success, OR same success with fewer tokens
         return self.skill_lift > 0.05 or (self.skill_lift >= 0 and self.token_savings > 0.2)
+
+
+class ScenarioJudgeConfig(BaseModel):
+    """Judge configuration for a scenario."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    criteria: list[str] | None = None
+
+
+class EvalScenario(BaseModel):
+    """Scenario definition for CI evaluation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(..., min_length=1)
+    skills: list[str] = Field(default_factory=list)
+    tests: str
+    judge: ScenarioJudgeConfig | None = None
+    include_baseline: bool = False
+
+
+class EvalManifest(BaseModel):
+    """Top-level CI manifest."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    scenarios: list[EvalScenario] = Field(default_factory=list)
+
+
+class ScenarioVariantResult(BaseModel):
+    """Aggregate result for one scenario variant."""
+
+    variant_id: str
+    variant_type: Literal["bundle", "ablation", "baseline"]
+    skills: list[str] = Field(default_factory=list)
+    omitted_skill: str | None = None
+    passed: bool
+    assertions_passed: int = 0
+    assertions_total: int = 0
+    hard_score: float = 0.0
+    judge_score: float | None = None
+    judge_summary: str | None = None
+    total_tokens: int = 0
+    average_turns: float = 0.0
+    run_folder: str | None = None
+
+
+class ScenarioContribution(BaseModel):
+    """Contribution delta for leaving one skill out of a bundle."""
+
+    skill: str
+    hard_score_delta: float = 0.0
+    judge_score_delta: float | None = None
+    passed_without_skill: bool = False
+
+
+class ScenarioReport(BaseModel):
+    """Report for one selected scenario."""
+
+    scenario_id: str
+    skills: list[str] = Field(default_factory=list)
+    tests_path: str
+    passed: bool
+    bundle: ScenarioVariantResult
+    ablations: list[ScenarioVariantResult] = Field(default_factory=list)
+    baseline: ScenarioVariantResult | None = None
+    contributions: list[ScenarioContribution] = Field(default_factory=list)
+
+
+class CiReport(BaseModel):
+    """Machine-readable report for a CI evaluation run."""
+
+    manifest_path: str
+    scope: str
+    base_ref: str | None = None
+    changed_files: list[str] = Field(default_factory=list)
+    changed_skills: list[str] = Field(default_factory=list)
+    selected_scenarios: list[str] = Field(default_factory=list)
+    success: bool = True
+    scenarios: list[ScenarioReport] = Field(default_factory=list)
 
 
 # Run logging models (similar to skills-test)

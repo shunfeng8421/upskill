@@ -18,13 +18,12 @@ from upskill.artifacts import ensure_directory, sanitize_artifact_name
 from upskill.executors.contracts import ExecutionRequest
 from upskill.models import (
     EvalResults,
-    ExpectedSpec,
     Skill,
     TestCase,
     TestResult,
     ValidationResult,
 )
-from upskill.validators import get_validator
+from upskill.verifiers import run_verifiers
 
 logger = logging.getLogger(__name__)
 
@@ -141,39 +140,11 @@ def load_eval_results_from_artifact_root(
 
 def check_expected(
     output: str,
-    expected: ExpectedSpec,
+    test_case: TestCase,
     workspace: Path | None = None,
-    test_case: TestCase | None = None,
-) -> tuple[bool, ValidationResult | None]:
-    """Check if output matches expected conditions.
-
-    Args:
-        output: The agent's output string
-        expected: Expected conditions dict (legacy format with "contains")
-        workspace: Optional workspace directory for file-based validation
-        test_case: Optional test case with custom validator config
-
-    Returns:
-        Tuple of (success, validation_result)
-    """
-    # Handle custom validator if specified
-    if test_case and test_case.validator:
-        validator = get_validator(test_case.validator)
-        if validator and workspace:
-            config = test_case.validator_config or {}
-            result = validator(
-                workspace=workspace,
-                output_file=test_case.output_file or "",
-                **config,
-            )
-            return result.passed, result
-
-    required = expected.contains
-    output_lower = output.lower()
-    if any(item.lower() not in output_lower for item in required):
-        return False, None
-
-    return True, None
+) -> ValidationResult:
+    """Run normalized deterministic verifiers for one test case."""
+    return run_verifiers(test_case, output=output, workspace=workspace)
 
 
 def format_test_prompt(test_case: TestCase) -> str:
@@ -216,7 +187,7 @@ def build_eval_execution_request(
             "instance_name": instance_name,
             "operation": operation,
             "skill_name": skill.name if skill else None,
-            "has_validator": bool(test_case.validator),
+            "has_validator": bool(test_case.effective_verifiers()),
         },
     )
 
@@ -321,15 +292,14 @@ async def _run_test_with_evaluator(
         _write_test_result_summary(normalized_artifact_dir / "test_result.json", result)
         return result
 
-    success, validation_result = check_expected(
+    validation_result = check_expected(
         execution_result.output_text or "",
-        test_case.expected,
-        execution_result.workspace_dir,
         test_case,
+        execution_result.workspace_dir,
     )
     result = TestResult(
         test_case=test_case,
-        success=success,
+        success=validation_result.passed,
         output=execution_result.output_text,
         tokens_used=execution_result.stats.total_tokens,
         turns=execution_result.stats.turns,
