@@ -606,17 +606,7 @@ upskill uses FastAgent model format:
 
 ## Local Models
 
-upskill supports local models through any OpenAI-compatible endpoint (Ollama, llama.cpp, vLLM, etc.).
-
-**Quick start with Ollama:**
-
-```bash
-# Start Ollama (default port 11434)
-ollama serve
-
-# Configure endpoint via fast-agent config/env, then evaluate
-upskill eval ./skills/my-skill/ --model generic.llama3.2:latest
-```
+upskill supports local models through any OpenAI-compatible endpoint (llama.cpp, vLLM, etc.).
 
 **With llama.cpp server:**
 
