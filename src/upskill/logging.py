@@ -351,7 +351,7 @@ def summarize_runs_to_csv(runs_folder: Path, output_path: Path | None = None) ->
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    with open(output_path, "w", newline="") as outfile:
+    with open(output_path, "w", newline="", encoding="utf-8") as outfile:
         writer = csv.DictWriter(outfile, fieldnames=FIELDNAMES)
         writer.writeheader()
 

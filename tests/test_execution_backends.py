@@ -160,7 +160,7 @@ async def test_local_fast_agent_executor_preserves_artifacts_and_parses_results(
     assert (request.artifact_dir / "request.json").exists()
     assert (request.artifact_dir / "stdout.txt").exists()
     assert (request.artifact_dir / "stderr.txt").exists()
-    assert (request.artifact_dir / "workspace" / "context.txt").read_text() == "hello"
+    assert (request.artifact_dir / "workspace" / "context.txt").read_text(encoding="utf-8") == "hello"
     assert (request.artifact_dir / "workspace" / "fastagent.config.yaml").exists()
     assert (request.artifact_dir / "cards" / "evaluator.md").exists()
     assert not (request.artifact_dir / "cards" / "skill_gen.md").exists()
@@ -297,7 +297,7 @@ async def test_remote_fast_agent_executor_preserves_artifacts_and_parses_results
     assert (request.artifact_dir / "stdout.txt").exists()
     assert (request.artifact_dir / "stderr.txt").exists()
     assert (request.artifact_dir / "remote_output" / "results" / "request_1.json").exists()
-    assert (request.artifact_dir / "workspace" / "context.txt").read_text() == "remote hello"
+    assert (request.artifact_dir / "workspace" / "context.txt").read_text(encoding="utf-8") == "remote hello"
     assert not (request.artifact_dir / "cards" / "skill_gen.md").exists()
     assert not (request.artifact_dir / "cards" / "test_gen.md").exists()
     assert submitted_labels == {
@@ -353,7 +353,7 @@ async def test_remote_fast_agent_executor_submit_preserves_artifacts(
     assert not (request.artifact_dir / "cards" / "skill_gen.md").exists()
     assert not (request.artifact_dir / "cards" / "test_gen.md").exists()
     assert (request.artifact_dir / "skills" / "write-good-prs" / "SKILL.md").exists()
-    submitted_job = json.loads((request.artifact_dir / "submitted_job.json").read_text())
+    submitted_job = json.loads((request.artifact_dir / "submitted_job.json").read_text(encoding="utf-8"))
     assert submitted_job["job_id"] == "evalstate/job-123"
     assert submitted_job["run_id"] == "run-456"
 
