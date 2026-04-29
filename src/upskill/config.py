@@ -2,15 +2,82 @@
 
 from __future__ import annotations
 
+import os
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
+
+UPSKILL_CONFIG_FILE = "upskill.config.yaml"
+LEGACY_CONFIG_FILE = "config.yaml"
+UPSKILL_CONFIG_ENV = "UPSKILL_CONFIG"
+
+
+@dataclass(frozen=True)
+class UpskillConfigPathResolution:
+    """Resolved upskill config path and where it was found."""
+
+    path: Path | None
+    source: str
+    exists: bool
 
 
 def get_config_dir() -> Path:
     """Get the upskill config directory."""
     return Path.home() / ".config" / "upskill"
+
+
+def get_local_config_path() -> Path:
+    """Get the project-local upskill config path."""
+    return Path.cwd() / UPSKILL_CONFIG_FILE
+
+
+def get_legacy_config_path() -> Path:
+    """Get the legacy user-level upskill config path."""
+    return get_config_dir() / LEGACY_CONFIG_FILE
+
+
+def find_upskill_config_path() -> Path | None:
+    """Find upskill config path in priority order."""
+    return resolve_upskill_config_path().path
+
+
+def resolve_upskill_config_path() -> UpskillConfigPathResolution:
+    """Find upskill config path in priority order.
+
+    Priority:
+      1. UPSKILL_CONFIG env var
+      2. ./upskill.config.yaml (project local)
+      3. ~/.config/upskill/config.yaml (legacy)
+    """
+    config_override = os.getenv(UPSKILL_CONFIG_ENV)
+    if config_override:
+        override_path = Path(config_override).expanduser()
+        return UpskillConfigPathResolution(
+            path=override_path,
+            source=f"{UPSKILL_CONFIG_ENV} env var",
+            exists=override_path.exists(),
+        )
+
+    local_config = get_local_config_path()
+    if local_config.exists():
+        return UpskillConfigPathResolution(
+            path=local_config,
+            source="project-local config",
+            exists=True,
+        )
+
+    legacy_config = get_legacy_config_path()
+    if legacy_config.exists():
+        return UpskillConfigPathResolution(
+            path=legacy_config,
+            source="legacy user config",
+            exists=True,
+        )
+
+    return UpskillConfigPathResolution(path=None, source="defaults", exists=False)
 
 
 def get_default_skills_dir() -> Path:
@@ -38,9 +105,22 @@ def find_config_path() -> Path:
 class Config(BaseModel):
     """upskill configuration."""
 
+    model_config = ConfigDict(populate_by_name=True)
+
     # Model settings
-    model: str = Field(default="sonnet", description="Model for generation (FastAgent format)")
-    eval_model: str | None = Field(default=None, description="Model for eval (defaults to model)")
+    skill_generation_model: str = Field(
+        default="sonnet",
+        validation_alias=AliasChoices("skill_generation_model", "model"),
+        description="Model for skill generation (FastAgent format)",
+    )
+    eval_model: str | None = Field(
+        default=None,
+        description="Model for evaluation (defaults to skill_generation_model)",
+    )
+    test_gen_model: str | None = Field(
+        default=None,
+        description="Model for test generation (defaults to skill generation model)",
+    )
 
     # Directory settings
     skills_dir: Path = Field(
@@ -51,8 +131,31 @@ class Config(BaseModel):
     )
 
     # Generation settings
-    auto_eval: bool = Field(default=True, description="Run eval after generation")
     max_refine_attempts: int = Field(default=2, description="Max refinement iterations")
+
+    # Execution settings
+    executor: Literal["local", "jobs"] = Field(
+        default="local",
+        description="Default execution backend for evaluation and refinement",
+    )
+    num_runs: int | None = Field(
+        default=None,
+        ge=1,
+        description="Default runs per model for eval/benchmark when CLI --runs is omitted",
+    )
+    max_parallel: int = Field(
+        default=5,
+        ge=1,
+        description="Maximum concurrent evaluation executions per phase",
+    )
+    jobs_secrets: str = Field(
+        default="HF_TOKEN",
+        description="Comma-separated env var names to forward to HF Jobs when using executor=jobs",
+    )
+    jobs_image: str = Field(
+        default="ghcr.io/astral-sh/uv:python3.13-bookworm",
+        description="Container image used for HF Jobs when using executor=jobs",
+    )
 
     # FastAgent settings
     fastagent_config: Path | None = Field(default=None, description="Path to fastagent.config.yaml")
@@ -60,7 +163,10 @@ class Config(BaseModel):
     @classmethod
     def load(cls) -> Config:
         """Load config from file, or return defaults."""
-        config_path = get_config_dir() / "config.yaml"
+        config_path = find_upskill_config_path()
+        if config_path is None:
+            return cls()
+
         if config_path.exists():
             with open(config_path) as f:
                 data = yaml.safe_load(f) or {}
@@ -72,13 +178,14 @@ class Config(BaseModel):
             if "fastagent_config" in data and isinstance(data["fastagent_config"], str):
                 data["fastagent_config"] = Path(data["fastagent_config"])
             return cls(**data)
+
         return cls()
 
     def save(self) -> None:
         """Save config to file."""
-        config_dir = get_config_dir()
-        config_dir.mkdir(parents=True, exist_ok=True)
-        config_path = config_dir / "config.yaml"
+        config_path = find_upskill_config_path() or get_local_config_path()
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+
         data = self.model_dump(mode="json")
         # Convert Path objects to strings for YAML
         data["skills_dir"] = str(self.skills_dir)
@@ -91,7 +198,20 @@ class Config(BaseModel):
     @property
     def effective_eval_model(self) -> str:
         """Get the model to use for evaluation."""
-        return self.eval_model or self.model
+        return self.eval_model or self.skill_generation_model
+
+    def effective_num_runs(self, command: Literal["eval", "benchmark"]) -> int:
+        """Get the number of runs to use when CLI ``--runs`` is omitted."""
+        if self.num_runs is not None:
+            return self.num_runs
+        if command == "benchmark":
+            return 3
+        return 1
+
+    @property
+    def model(self) -> str:
+        """Backward-compatible alias for ``skill_generation_model``."""
+        return self.skill_generation_model
 
     @property
     def effective_fastagent_config(self) -> Path:

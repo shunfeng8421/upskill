@@ -1,0 +1,6 @@
+cases:
+  - input: "Say fixture"
+    expected:
+      contains:
+        - fixture
+        - response

@@ -1,8 +1,6 @@
 ---
 type: agent
-# note that this takes precedence over cli switch. you can set model string directly.
-#model: opus?structured=tool_use
-model: opus?reasoning=1024
 description: Generate test cases for evaluating skills.
+model: $system.test_gen
 ---
 You generate test cases for evaluating AI agent skills. Output only valid JSON.

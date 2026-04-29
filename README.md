@@ -4,12 +4,18 @@
 
 Generate and evaluate agent skills based on traces with agents. Create skills with teacher models (expensive/slow) that student models (cheap/fast) can use to perform harder tasks reliably.
 
+
+> [!TIP] 
+> 
+> UPskill v2 - recommended default config file now runs evaluations on Hugging Face Jobs. Make sure
+> to set your `HF_TOKEN` and use `--artifact-repo <dataset-name>` for job creation and result capture  
+
 ## Quick Start
 
 Install upskill:
 
 ```bash
-pip install upskill
+uv pip install upskill
 # or just use uv
 uvx upskill
 ```
@@ -42,6 +48,78 @@ View the results later.
 upskill runs --skill git-commit-messages
 ```
 
+## Development checks
+
+This repo uses a CI flow inspired by `fast-agent` with separate format, lint, typecheck, and test
+stages.
+
+Install dev dependencies:
+
+```bash
+uv sync --extra dev
+```
+
+Run the quality gates locally:
+
+```bash
+uv run scripts/format.py
+uv run scripts/lint.py
+uv run scripts/typecheck.py
+uv run scripts/cpd.py --check
+uv run --extra dev pytest -v
+```
+
+Or use the helper script to run the whole sequence:
+
+```bash
+uv run scripts/check.py
+```
+
+Add `--sync` to include `uv sync --extra dev`, or `--skip-tests` for a faster static-only pass.
+
+To auto-format before re-running checks:
+
+```bash
+uv run --extra dev scripts/format.py --write
+```
+
+Current enforced standards:
+
+- `ruff format --check` for formatting
+- `ruff check` for style, imports, modernization, bugbear, simplify, and import-hygiene rules
+- cyclomatic complexity via Ruff `C90` with `max-complexity = 15`
+- `ty check` across `src`, `tests`, and `scripts`
+- `pmd cpd` via `scripts/cpd.py --check` to flag duplicated code in `src/`
+- `pytest` for the test suite
+
+CI enforcement lives in `.github/workflows/ci.yml` and runs on pushes and pull requests targeting
+`main`.
+
+## Model Handling Overview
+
+upskill uses distinct phases with explicit model roles:
+
+- **Skill generation**: create/refine `SKILL.md`
+- **Test generation**: create synthetic evaluation cases
+- **Evaluation**: run tests against evaluator model(s)
+- **Benchmark**: repeated evaluation across multiple runs/models
+
+Model flags by command:
+
+| Command | Flag | Meaning |
+|---|---|---|
+| `generate` | `--model` | Skill generation/refinement model |
+| `generate` | `--test-gen-model` | Test generation model override |
+| `generate` | `--eval-model` | Optional extra cross-model eval pass |
+| `eval` | `-m/--model` | Evaluation model(s) (repeatable) |
+| `eval` | `--test-gen-model` | Test generation model override (when tests are generated) |
+| `benchmark` | `-m/--model` | Evaluation model(s) to benchmark |
+| `benchmark` | `--test-gen-model` | Test generation model override (when tests are generated) |
+| `runs` / `plot` | `-m/--model` | Historical results filter only |
+
+`upskill eval` enters **benchmark mode** whenever you pass multiple `-m` values or `--runs > 1`.
+In benchmark mode, baseline comparison is always off; `--no-baseline` is redundant.
+
 ## Commands
 
 ### `upskill generate`
@@ -57,12 +135,15 @@ upskill generate TASK [OPTIONS]
 
 **Options:**
 - `-e, --example` - Input -> output example (can be repeated)
-- `--tool` - Generate from MCP tool schema (path#tool_name)
 - `-f, --from PATH` - Improve from existing skill dir or agent trace file (auto-detected)
-- `-m, --model MODEL` - Model for generation (e.g., 'sonnet', 'haiku', 'anthropic.claude-sonnet-4-20250514')
+- `-m, --model MODEL` - Skill generation model (e.g., 'sonnet', 'haiku', 'anthropic.claude-sonnet-4-20250514')
+- `--test-gen-model MODEL` - Override test generation model for this run
 - `-o, --output PATH` - Output directory for skill
 - `--no-eval` - Skip evaluation and refinement
 - `--eval-model MODEL` - Different model to evaluate skill on
+- `--executor [local|jobs]` - Execution backend for evaluation/refinement; overrides config
+- `--artifact-repo TEXT` - Dataset repo for remote fast-agent job artifacts (required with `--executor jobs`)
+- `--max-parallel N` - Max concurrent evaluation executions; overrides config
 - `--runs-dir PATH` - Directory for run logs (default: ./runs)
 - `--log-runs / --no-log-runs` - Log run data (default: enabled)
 
@@ -74,6 +155,9 @@ upskill generate "parse JSON Schema files"
 
 # Make and evaluate skills for less powerful models
 upskill generate "write git commits" --model sonnet --eval-model haiku
+
+# Remote execution on Hugging Face Jobs
+upskill generate "parse invoices" --executor jobs --artifact-repo <user>/upskill-tests
 
 # Improve an existing skill (auto-detected as directory)
 upskill generate "add more error handling examples" --from ./skills/api-errors/
@@ -120,11 +204,12 @@ upskill eval SKILL_PATH [OPTIONS]
 **Options:**
 - `-t, --tests PATH` - Test cases JSON file
 - `-m, --model MODEL` - Model(s) to evaluate against (repeatable for multi-model benchmarking)
-- `--runs N` - Number of runs per model (default: 1)
-- `--provider [anthropic|openai|generic]` - API provider (auto-detected as 'generic' when --base-url is provided)
-- `--base-url URL` - Custom API endpoint for local models
-- `--no-baseline` - Skip baseline comparison
+- `--test-gen-model MODEL` - Override test generation model when tests must be generated
+- `--runs N` - Number of runs per model; overrides config
+- `--no-baseline` - Skip baseline comparison (simple eval mode only; ignored in benchmark mode)
 - `-v, --verbose` - Show per-test results
+- `--executor [local|jobs]` - Execution backend for evaluation; overrides config
+- `--max-parallel N` - Max concurrent evaluation executions; overrides config
 - `--log-runs / --no-log-runs` - Log run data (default: enabled)
 - `--runs-dir PATH` - Directory for run logs
 
@@ -149,13 +234,14 @@ upskill eval ./skills/my-skill/ -m haiku -m sonnet
 # Multiple runs per model for statistical significance
 upskill eval ./skills/my-skill/ -m haiku -m sonnet --runs 5
 
-# Evaluate on local model (llama.cpp server)
-upskill eval ./skills/my-skill/ \
-    -m "unsloth/GLM-4.7-Flash-GGUF:Q4_0" \
-    --base-url http://localhost:8080/v1
+# Evaluate a local model configured in fast-agent
+upskill eval ./skills/my-skill/ -m generic.my-model
 
 # Skip baseline (just test with skill)
 upskill eval ./skills/my-skill/ --no-baseline
+
+# Benchmark mode is triggered by multiple models OR --runs > 1
+upskill eval ./skills/my-skill/ -m haiku --runs 5
 
 # Disable run logging
 upskill eval ./skills/my-skill/ --no-log-runs
@@ -246,7 +332,7 @@ upskill runs [OPTIONS]
 **Options:**
 - `-d, --dir PATH` - Runs directory
 - `-s, --skill TEXT` - Filter by skill name(s) (repeatable)
-- `-m, --model TEXT` - Filter by model(s) (repeatable)
+- `-m, --model TEXT` - Filter historical run data by model(s) (repeatable)
 - `--metric [success|tokens]` - Metric to display (default: success)
 - `--csv PATH` - Export to CSV instead of plot
 
@@ -369,15 +455,55 @@ Disable with `--no-log-runs`.
 
 ## Configuration
 
-### upskill config (`~/.config/upskill/config.yaml`)
+### upskill config (`./upskill.config.yaml`)
 
 ```yaml
-model: sonnet                    # Default generation model
+skill_generation_model: sonnet   # Default skill generation model
 eval_model: haiku               # Default evaluation model (optional)
+test_gen_model: null            # Optional test generation model
 skills_dir: ./skills            # Where to save skills
 runs_dir: ./runs                # Where to save run logs
-max_refine_attempts: 3          # Refinement iterations
+max_refine_attempts: 2          # Refinement iterations
+executor: local                 # Default execution backend
+num_runs: 1                     # Default eval/benchmark runs when --runs is omitted
+max_parallel: 5                 # Default concurrent evaluation executions
+jobs_secrets: HF_TOKEN          # Comma-separated HF Jobs env var names to forward
+jobs_image: ghcr.io/astral-sh/uv:python3.13-bookworm  # HF Jobs container image
+# fastagent_config: ./fastagent.config.yaml  # Optional FastAgent config override
 ```
+
+`test_gen_model` fallback behavior:
+
+- CLI `--test-gen-model` overrides config for a single run.
+- If set, test generation uses `test_gen_model`.
+- If unset, test generation falls back to `skill_generation_model`.
+- For `eval`/`benchmark`, this intentionally uses `skill_generation_model` (not `eval_model`) so generated tests stay
+  stable when sweeping multiple evaluation models.
+
+Backward compatibility: `model` is still accepted in config files as a legacy alias for
+`skill_generation_model`.
+
+CLI flags override config values for execution settings:
+
+- `--executor` overrides `executor`
+- `--runs` overrides `num_runs`
+- `--max-parallel` overrides `max_parallel`
+- `--jobs-secrets` overrides `jobs_secrets`
+
+If you set `executor: jobs`, you still need the required jobs-specific CLI inputs such as
+`--artifact-repo`.
+
+`jobs_secrets` is a comma-separated list of environment variable names to forward into
+remote HF Jobs runs. It should contain secret names such as `HF_TOKEN` or
+`ANTHROPIC_API_KEY`, not literal secret values.
+
+`jobs_image` controls which container image HF Jobs uses for remote execution.
+
+Config lookup order:
+
+1. `UPSKILL_CONFIG` environment variable (path)
+2. `./upskill.config.yaml` (project local)
+3. `~/.config/upskill/config.yaml` (legacy fallback)
 
 ### FastAgent config (`fastagent.config.yaml`)
 
@@ -480,19 +606,7 @@ upskill uses FastAgent model format:
 
 ## Local Models
 
-upskill supports local models through any OpenAI-compatible endpoint (Ollama, llama.cpp, vLLM, etc.).
-
-**Quick start with Ollama:**
-
-```bash
-# Start Ollama (default port 11434)
-ollama serve
-
-# Evaluate with a local model
-upskill eval ./skills/my-skill/ \
-    --model llama3.2:latest \
-    --base-url http://localhost:11434/v1
-```
+upskill supports local models through any OpenAI-compatible endpoint (llama.cpp, vLLM, etc.).
 
 **With llama.cpp server:**
 
@@ -500,10 +614,6 @@ upskill eval ./skills/my-skill/ \
 # Start llama.cpp server
 ./llama-server -m model.gguf --port 8080
 
-# Evaluate with the local model
-upskill eval ./skills/my-skill/ \
-    --model my-model \
-    --base-url http://localhost:8080/v1
+# Configure endpoint via fast-agent config/env, then evaluate
+upskill eval ./skills/my-skill/ --model generic.my-model
 ```
-
-When `--base-url` is provided, the provider is automatically set to `generic` unless you specify `--provider` explicitly.

@@ -1,6 +1,9 @@
 ---
 type: agent
 description: Generate skill documents from task descriptions.
+skills: []
+shell: false
+model: $system.skill_gen
 ---
 You generate "skills" - instruction documents that teach AI coding agents how to perform tasks.
 
