@@ -50,8 +50,7 @@ _HF_AUTH_RATE_LIMIT_MARKERS = (
 )
 _HF_SUBMISSION_LOCK = threading.RLock()
 _VERIFIED_ARTIFACT_REPOS: set[str] = set()
-_HF_HUB_CLI_SPEC = "huggingface_hub==1.7.2"
-_FAST_AGENT_SPEC = "fast-agent-mcp==0.6.8"
+_FAST_AGENT_SPEC = "fast-agent-mcp==0.6.26"
 _MAX_HF_JOB_LABEL_VALUE_LENGTH = 63
 _HF_RETRY_ATTEMPTS = 5
 _HF_INITIAL_RETRY_DELAY_SECONDS = 2.0
@@ -500,7 +499,8 @@ def _render_bundle_job_script() -> str:
             "WORK=/workspace",
             'mkdir -p "$WORK/out"',
             'cd "$WORK"',
-            f'uv pip install --system "{_HF_HUB_CLI_SPEC}" "{_FAST_AGENT_SPEC}"',
+            'export FAST_AGENT_ENV_DIR="$WORK/out/fast-agent-env"',
+            f'uv pip install --system "{_FAST_AGENT_SPEC}"',
             'download_with_retries "$ARTIFACT_REPO" "inputs/$RUN_ID/bundle.tar.gz" "$WORK"',
             'tar -xzf "$WORK/inputs/$RUN_ID/bundle.tar.gz" -C "$WORK"',
             "set +e",
@@ -508,6 +508,13 @@ def _render_bundle_job_script() -> str:
             "status=$?",
             "set -e",
             'echo "$status" > "$WORK/out/exit_code.txt"',
+            "set +e",
+            'fast-agent --env "$FAST_AGENT_ENV_DIR" export latest --agent "$FAST_AGENT_EXPORT_AGENT" '
+            '--output "$WORK/out/trace.jsonl" --hf-dataset "$ARTIFACT_REPO" '
+            '--hf-dataset-path "$TRACE_DATASET_PATH" >"$WORK/out/trace_export_stdout.txt" '
+            '2>"$WORK/out/trace_export_stderr.txt"',
+            'echo "$?" > "$WORK/out/trace_export_exit_code.txt"',
+            "set -e",
             'upload_with_retries "$ARTIFACT_REPO" "$WORK/out" "outputs/$RUN_ID" '
             '"outputs: $RUN_ID (exit=$status)"',
             'exit "$status"',
@@ -523,6 +530,8 @@ def _build_hf_jobs_run_command(
     model: str,
     labels: Mapping[str, str] | None,
     job_script: str,
+    trace_dataset_path: str,
+    trace_agent: str,
 ) -> list[str]:
     """Build the ``hf jobs run`` command for a prepared bundle submission."""
     namespace = _resolve_jobs_namespace(
@@ -546,6 +555,10 @@ def _build_hf_jobs_run_command(
         f"RUN_ID={run_id}",
         "--env",
         f"FAST_MODEL={model}",
+        "--env",
+        f"FAST_AGENT_EXPORT_AGENT={trace_agent}",
+        "--env",
+        f"TRACE_DATASET_PATH={trace_dataset_path}",
     ]
     if namespace is not None:
         command.extend(["--namespace", namespace])
@@ -567,6 +580,8 @@ def _submit_prepared_bundle_job(
     run_id: str,
     model: str,
     labels: Mapping[str, str] | None = None,
+    trace_dataset_path: str | None = None,
+    trace_agent: str = "evaluator",
 ) -> SubmittedJob:
     """Submit a remote job for a bundle that is already present in the dataset."""
     job_script = _render_bundle_job_script()
@@ -576,6 +591,8 @@ def _submit_prepared_bundle_job(
         model=model,
         labels=labels,
         job_script=job_script,
+        trace_dataset_path=trace_dataset_path or f"traces/eval/{model}/{run_id}.json",
+        trace_agent=trace_agent,
     )
     with _HF_SUBMISSION_LOCK:
         completed = _run_hf_command(command)
@@ -597,6 +614,8 @@ def _submit_bundle_job(
     run_id: str,
     model: str,
     labels: Mapping[str, str] | None = None,
+    trace_dataset_path: str | None = None,
+    trace_agent: str = "evaluator",
 ) -> SubmittedJob:
     upload = _upload_bundle_input(
         bundle_archive=bundle_archive,
@@ -615,4 +634,6 @@ def _submit_bundle_job(
         run_id=run_id,
         model=model,
         labels=labels,
+        trace_dataset_path=trace_dataset_path,
+        trace_agent=trace_agent,
     )

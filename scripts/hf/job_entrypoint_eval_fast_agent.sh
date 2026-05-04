@@ -4,10 +4,11 @@ set -euo pipefail
 BUNDLE_DIR="${1:?bundle_dir required}"
 OUT_DIR="${2:?out_dir required}"
 
-mkdir -p "$OUT_DIR/results" "$OUT_DIR/logs" "$OUT_DIR/status" "$OUT_DIR/workspaces"
+FAST_AGENT_ENV_DIR="${FAST_AGENT_ENV_DIR:-$OUT_DIR/fast-agent-env}"
+mkdir -p "$OUT_DIR/results" "$OUT_DIR/logs" "$OUT_DIR/status" "$OUT_DIR/workspaces" "$FAST_AGENT_ENV_DIR"
 cp -f "$BUNDLE_DIR/manifest.json" "$OUT_DIR/manifest.json" || true
 
-COMMON=(fast-agent go --skills-dir "$BUNDLE_DIR/skills" --quiet)
+COMMON=(fast-agent --env "$FAST_AGENT_ENV_DIR" go --skills-dir "$BUNDLE_DIR/skills" --quiet)
 if [[ -f "$BUNDLE_DIR/fastagent.config.yaml" ]]; then
   COMMON+=(--config-path "$BUNDLE_DIR/fastagent.config.yaml")
 fi

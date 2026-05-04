@@ -169,6 +169,49 @@ async def test_local_fast_agent_executor_preserves_artifacts_and_parses_results(
 
 
 @pytest.mark.asyncio
+async def test_local_fast_agent_executor_exports_trace_to_artifact_repo(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = _build_request(tmp_path)
+    executor = LocalFastAgentExecutor(fast_agent_bin="fast-agent", artifact_repo="ns/repo")
+    commands: list[tuple[str, ...]] = []
+
+    class FakeProcess:
+        returncode = 0
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            return (b"", b"")
+
+    async def fake_create_subprocess_exec(*args: str, **kwargs: object) -> FakeProcess:
+        del kwargs
+        commands.append(args)
+        if args[:2] == ("fast-agent", "go"):
+            results_index = args.index("--results") + 1
+            _write_result_history(Path(args[results_index]), assistant_text="Final answer")
+        if args[:2] == ("fast-agent", "export"):
+            output_index = args.index("--output") + 1
+            Path(args[output_index]).write_text("{}", encoding="utf-8")
+        return FakeProcess()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    handle = await executor.execute(request)
+    result = await executor.collect(handle)
+
+    assert result.error is None
+    export_command = next(
+        command for command in commands if command[:2] == ("fast-agent", "export")
+    )
+    assert "--hf-dataset" in export_command
+    assert export_command[export_command.index("--hf-dataset") + 1] == "ns/repo"
+    dataset_path = export_command[export_command.index("--hf-dataset-path") + 1]
+    assert dataset_path.startswith("traces/eval/haiku/")
+    assert dataset_path.endswith("-test-run.jsonl")
+    assert (request.artifact_dir / "trace.jsonl").exists()
+
+
+@pytest.mark.asyncio
 async def test_local_fast_agent_executor_fails_when_results_artifact_is_missing(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -518,6 +561,58 @@ async def test_evaluate_skill_emits_per_test_progress_messages(tmp_path: Path) -
     assert results.with_skill_success_rate == 1.0
     assert "starting with-skill test 1/1" in messages
     assert "finished with-skill test 1/1 (ok)" in messages
+
+
+@pytest.mark.asyncio
+async def test_evaluate_skill_progress_failure_includes_reason(tmp_path: Path) -> None:
+    skill = Skill(
+        name="write-good-prs",
+        description="Write good pull request descriptions.",
+        body="Use a clear structure.",
+    )
+    test_case = TestCase(input="prompt", expected=ExpectedSpec(contains=["answer"]))
+    messages: list[str] = []
+
+    class FakeExecutor:
+        async def execute(self, request: ExecutionRequest) -> ExecutionHandle:
+            request.artifact_dir.mkdir(parents=True, exist_ok=True)
+            workspace_dir = request.artifact_dir / "workspace"
+            workspace_dir.mkdir(parents=True, exist_ok=True)
+            task = asyncio.create_task(
+                asyncio.sleep(
+                    0,
+                    result=ExecutionResult(
+                        output_text="wrong",
+                        raw_results_path=None,
+                        stdout_path=request.artifact_dir / "stdout.txt",
+                        stderr_path=request.artifact_dir / "stderr.txt",
+                        artifact_dir=request.artifact_dir,
+                        workspace_dir=workspace_dir,
+                        stats=ConversationStats(),
+                    ),
+                )
+            )
+            return ExecutionHandle(request=request, task=task)
+
+        async def collect(self, handle: ExecutionHandle) -> ExecutionResult:
+            return await handle.task
+
+        async def cancel(self, handle: ExecutionHandle) -> None:
+            handle.task.cancel()
+
+    await evaluate_skill(
+        skill,
+        [test_case],
+        FakeExecutor(),
+        model="haiku",
+        fastagent_config_path=tmp_path / "fastagent.config.yaml",
+        cards_source_dir=tmp_path,
+        artifact_root=tmp_path / "eval",
+        run_baseline=False,
+        progress_callback=messages.append,
+    )
+
+    assert "finished with-skill test 1/1 (failed: missing required output text: answer)" in messages
 
 
 @pytest.mark.asyncio

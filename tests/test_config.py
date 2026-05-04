@@ -39,6 +39,7 @@ def test_config_save_uses_env_override_path_when_file_is_missing(tmp_path, monke
     config = Config(
         skill_generation_model="haiku",
         executor="jobs",
+        artifact_repo="ns/repo",
         num_runs=4,
         max_parallel=7,
         jobs_secrets="HF_TOKEN,ANTHROPIC_API_KEY",
@@ -54,6 +55,7 @@ def test_config_save_uses_env_override_path_when_file_is_missing(tmp_path, monke
 
     assert saved["skill_generation_model"] == "haiku"
     assert saved["executor"] == "jobs"
+    assert saved["artifact_repo"] == "ns/repo"
     assert saved["num_runs"] == 4
     assert saved["max_parallel"] == 7
     assert saved["jobs_secrets"] == "HF_TOKEN,ANTHROPIC_API_KEY"
@@ -67,6 +69,7 @@ def test_config_load_reads_execution_settings(tmp_path, monkeypatch) -> None:
             [
                 "skill_generation_model: sonnet",
                 "executor: jobs",
+                "artifact_repo: ns/repo",
                 "num_runs: 2",
                 "max_parallel: 6",
                 "jobs_secrets: HF_TOKEN,OPENAI_API_KEY",
@@ -81,7 +84,14 @@ def test_config_load_reads_execution_settings(tmp_path, monkeypatch) -> None:
 
     assert config.skill_generation_model == "sonnet"
     assert config.executor == "jobs"
+    assert config.artifact_repo == "ns/repo"
     assert config.num_runs == 2
     assert config.max_parallel == 6
     assert config.jobs_secrets == "HF_TOKEN,OPENAI_API_KEY"
     assert config.jobs_image == "ghcr.io/example/custom:latest"
+
+
+def test_config_defaults_to_jobs_executor() -> None:
+    config = Config()
+
+    assert config.executor == "jobs"

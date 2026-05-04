@@ -438,7 +438,8 @@ def test_submit_bundle_job_uses_prepared_artifact_repo(
     assert "--namespace" in jobs_run_call
     assert jobs_run_call[jobs_run_call.index("--namespace") + 1] == "ns"
     assert "ghcr.io/astral-sh/uv:python3.13-bookworm" in jobs_run_call
-    assert any("huggingface_hub==1.7.2" in arg for arg in jobs_run_call)
+    assert any("fast-agent-mcp==0.6.26" in arg for arg in jobs_run_call)
+    assert not any("huggingface_hub==" in arg for arg in jobs_run_call)
 
 
 def test_build_hf_jobs_run_command_uses_configured_image() -> None:
@@ -451,6 +452,8 @@ def test_build_hf_jobs_run_command_uses_configured_image() -> None:
         model="haiku",
         labels=None,
         job_script="echo hi",
+        trace_dataset_path="traces/eval/haiku/run-123.json",
+        trace_agent="evaluator",
     )
 
     assert command[-5:] == [
@@ -467,8 +470,14 @@ def test_render_bundle_job_script_retries_auth_rate_limits_for_downloads_and_upl
 
     assert "rate limit for the /whoami-v2 endpoint" in script
     assert "local delay=2" in script
+    assert 'export FAST_AGENT_ENV_DIR="$WORK/out/fast-agent-env"' in script
     assert 'download_with_retries "$ARTIFACT_REPO" "inputs/$RUN_ID/bundle.tar.gz" "$WORK"' in script
     assert 'run_hf_with_retries hf upload "$repo" "$src" "$dest"' in script
+    assert (
+        'fast-agent --env "$FAST_AGENT_ENV_DIR" export latest --agent "$FAST_AGENT_EXPORT_AGENT"'
+        in script
+    )
+    assert '--hf-dataset-path "$TRACE_DATASET_PATH"' in script
 
 
 def test_submit_bundle_job_passes_labels_to_hf_jobs_run(

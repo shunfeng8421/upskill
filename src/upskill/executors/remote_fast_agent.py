@@ -30,6 +30,7 @@ from upskill.hf_jobs import (
 )
 from upskill.models import ConversationStats
 from upskill.result_parsing import parse_fast_agent_results
+from upskill.trace_export import build_trace_dataset_path
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -199,12 +200,15 @@ class RemoteFastAgentExecutor:
     def _submit_bundle(self, request: ExecutionRequest, bundle_archive: Path) -> SubmittedJob:
         run_id = _make_run_id("request", request.model, request.label)
         labels = self._build_job_labels(request, run_id=run_id)
+        trace_dataset_path = build_trace_dataset_path(request, run_id=run_id)
         submission = _submit_bundle_job(
             bundle_archive=bundle_archive,
             jobs_config=self._jobs_config,
             run_id=run_id,
             model=request.model,
             labels=labels,
+            trace_dataset_path=trace_dataset_path,
+            trace_agent=request.agent,
         )
         if self._progress_callback is not None:
             self._progress_callback(

@@ -464,7 +464,8 @@ test_gen_model: null            # Optional test generation model
 skills_dir: ./skills            # Where to save skills
 runs_dir: ./runs                # Where to save run logs
 max_refine_attempts: 2          # Refinement iterations
-executor: local                 # Default execution backend
+executor: jobs                  # Default execution backend
+artifact_repo: null             # HF dataset repo for remote job artifacts
 num_runs: 1                     # Default eval/benchmark runs when --runs is omitted
 max_parallel: 5                 # Default concurrent evaluation executions
 jobs_secrets: HF_TOKEN          # Comma-separated HF Jobs env var names to forward
@@ -486,12 +487,12 @@ Backward compatibility: `model` is still accepted in config files as a legacy al
 CLI flags override config values for execution settings:
 
 - `--executor` overrides `executor`
+- `--artifact-repo` overrides `artifact_repo`
 - `--runs` overrides `num_runs`
 - `--max-parallel` overrides `max_parallel`
 - `--jobs-secrets` overrides `jobs_secrets`
 
-If you set `executor: jobs`, you still need the required jobs-specific CLI inputs such as
-`--artifact-repo`.
+If you set `executor: jobs`, set `artifact_repo` in config or pass `--artifact-repo`.
 
 `jobs_secrets` is a comma-separated list of environment variable names to forward into
 remote HF Jobs runs. It should contain secret names such as `HF_TOKEN` or

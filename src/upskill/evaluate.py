@@ -52,6 +52,26 @@ def _format_execution_error(
     return error
 
 
+def _format_progress_status(result: TestResult) -> str:
+    """Return a concise per-test status for progress output."""
+    if result.success:
+        return "ok"
+
+    reason = result.error
+    if reason is None and result.validation_result is not None:
+        reason = result.validation_result.error_message
+        if reason is None and result.validation_result.details:
+            reason = result.validation_result.details[0]
+
+    if reason is None:
+        return "failed"
+
+    reason = " ".join(reason.split())
+    if len(reason) > 120:
+        reason = f"{reason[:117]}..."
+    return f"failed: {reason}"
+
+
 def _write_test_result_summary(path: Path, result: TestResult) -> None:
     """Persist a per-test result summary alongside raw artifacts."""
     path.write_text(
@@ -408,7 +428,7 @@ async def evaluate_skill(
                     operation=operation,
                 )
             if progress_callback is not None:
-                status = "ok" if result.success else "failed"
+                status = _format_progress_status(result)
                 progress_callback(f"finished {label} test {index}/{len(test_cases)} ({status})")
             return result
 

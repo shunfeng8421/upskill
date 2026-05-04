@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import replace
+from typing import TYPE_CHECKING
 
 from upskill.artifacts import (
     bundle_agent_card,
@@ -18,13 +19,26 @@ from upskill.executors.contracts import ExecutionHandle, ExecutionRequest, Execu
 from upskill.fast_agent_cli import build_fast_agent_command
 from upskill.models import ConversationStats
 from upskill.result_parsing import parse_fast_agent_results
+from upskill.trace_export import build_trace_dataset_path
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+    from pathlib import Path
 
 
 class LocalFastAgentExecutor:
     """Execute evaluation requests by shelling out to ``fast-agent`` locally."""
 
-    def __init__(self, *, fast_agent_bin: str = "fast-agent") -> None:
+    def __init__(
+        self,
+        *,
+        fast_agent_bin: str = "fast-agent",
+        artifact_repo: str | None = None,
+        progress_callback: Callable[[str], None] | None = None,
+    ) -> None:
         self._fast_agent_bin = fast_agent_bin
+        self._artifact_repo = artifact_repo
+        self._progress_callback = progress_callback
 
     async def execute(self, request: ExecutionRequest) -> ExecutionHandle:
         """Start a local subprocess execution."""
@@ -125,6 +139,14 @@ class LocalFastAgentExecutor:
             exit_error = f"fast-agent exited with code {process.returncode}."
             error = f"{error} {exit_error}".strip() if error else exit_error
 
+        metadata = {
+            **normalized_request.metadata,
+            "return_code": process.returncode,
+        }
+        trace_error = await self._export_trace(normalized_request, artifact_dir)
+        if trace_error is not None:
+            metadata["trace_export_error"] = trace_error
+
         result = ExecutionResult(
             output_text=parsed_output,
             raw_results_path=results_path if results_path.exists() else None,
@@ -134,9 +156,54 @@ class LocalFastAgentExecutor:
             workspace_dir=workspace_dir,
             stats=parsed_stats or ConversationStats(),
             error=error,
-            metadata={
-                **normalized_request.metadata,
-                "return_code": process.returncode,
-            },
+            metadata=metadata,
         )
         return result
+
+    async def _export_trace(self, request: ExecutionRequest, artifact_dir: Path) -> str | None:
+        """Export and publish the latest fast-agent trace when an artifact repo is configured."""
+        if self._artifact_repo is None:
+            return None
+
+        trace_path = artifact_dir / "trace.jsonl"
+        dataset_path = build_trace_dataset_path(request)
+        if self._progress_callback is not None:
+            self._progress_callback(f"exporting trace for {request.label} to {dataset_path}")
+        export_stdout_path = artifact_dir / "trace_export_stdout.txt"
+        export_stderr_path = artifact_dir / "trace_export_stderr.txt"
+        command = [
+            self._fast_agent_bin,
+            "export",
+            "latest",
+            "--agent",
+            request.agent,
+            "--output",
+            str(trace_path),
+            "--hf-dataset",
+            self._artifact_repo,
+            "--hf-dataset-path",
+            dataset_path,
+        ]
+        (artifact_dir / "trace_export_command.json").write_text(
+            json.dumps(command, indent=2),
+            encoding="utf-8",
+        )
+        process = await asyncio.create_subprocess_exec(
+            *command,
+            cwd=artifact_dir,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout_bytes, stderr_bytes = await process.communicate()
+        export_stdout_path.write_text(
+            stdout_bytes.decode("utf-8", errors="replace"), encoding="utf-8"
+        )
+        stderr_text = stderr_bytes.decode("utf-8", errors="replace")
+        export_stderr_path.write_text(stderr_text, encoding="utf-8")
+
+        if process.returncode != 0:
+            return f"fast-agent trace export exited with code {process.returncode}."
+        if self._progress_callback is not None:
+            self._progress_callback(f"exported trace for {request.label} to {dataset_path}")
+        return None

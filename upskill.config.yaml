@@ -17,6 +17,7 @@ max_refine_attempts: 2
 
 # Default execution settings for eval/benchmark/refinement.
 executor: jobs        # local | jobs; override with --executor
+artifact_repo: evalstate/uskill-test # HF dataset repo for remote job artifacts
 num_runs: 1            # Override with --runs
 max_parallel: 5        # Override with --max-parallel
 

@@ -135,8 +135,12 @@ class Config(BaseModel):
 
     # Execution settings
     executor: Literal["local", "jobs"] = Field(
-        default="local",
+        default="jobs",
         description="Default execution backend for evaluation and refinement",
+    )
+    artifact_repo: str | None = Field(
+        default=None,
+        description="Default Hugging Face dataset repo for remote job artifacts",
     )
     num_runs: int | None = Field(
         default=None,

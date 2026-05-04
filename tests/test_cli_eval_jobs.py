@@ -212,6 +212,7 @@ async def test_eval_uses_config_execution_defaults_when_cli_unset(
         runs_dir=tmp_path / "runs",
         fastagent_config=tmp_path / "fastagent.config.yaml",
         executor="jobs",
+        artifact_repo="ns/repo",
         num_runs=2,
         max_parallel=4,
         jobs_secrets="HF_TOKEN,ANTHROPIC_API_KEY",
@@ -227,6 +228,7 @@ async def test_eval_uses_config_execution_defaults_when_cli_unset(
         build_calls.append(name)
         jobs_config = kwargs["jobs_config"]
         assert isinstance(jobs_config, JobsConfig)
+        assert jobs_config.artifact_repo == "ns/repo"
         assert jobs_config.jobs_secrets == "HF_TOKEN,ANTHROPIC_API_KEY"
         assert jobs_config.jobs_image == "ghcr.io/example/custom:latest"
         return fake_executor
@@ -258,7 +260,7 @@ async def test_eval_uses_config_execution_defaults_when_cli_unset(
         no_baseline=False,
         verbose=False,
         executor_name=None,
-        artifact_repo="ns/repo",
+        artifact_repo=None,
         wait=True,
         jobs_timeout="2h",
         jobs_flavor="cpu-basic",

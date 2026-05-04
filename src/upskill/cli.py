@@ -113,7 +113,10 @@ def _jobs_execution_options(
         ),
         click.option(
             "--artifact-repo",
-            help="Dataset repo for remote job artifacts (required with --executor jobs)",
+            help=(
+                "Dataset repo for remote job artifacts. Overrides `artifact_repo` in "
+                "upskill.config.yaml; required when using --executor jobs."
+            ),
         ),
         click.option(
             "--wait/--no-wait",
@@ -249,11 +252,15 @@ def _build_executor(
     name: ExecutorName,
     *,
     jobs_config: JobsConfig | None = None,
+    artifact_repo: str | None = None,
     progress_callback: Callable[[str], None] | None = None,
 ) -> Executor:
     """Construct an evaluation executor from a user-facing executor name."""
     if name == "local":
-        return LocalFastAgentExecutor()
+        return LocalFastAgentExecutor(
+            artifact_repo=artifact_repo,
+            progress_callback=progress_callback,
+        )
     if jobs_config is None:
         raise click.ClickException("The jobs executor requires jobs configuration.")
     _ensure_jobs_artifact_repo_access(jobs_config)
@@ -294,6 +301,11 @@ def _resolve_jobs_secrets(config: Config, cli_jobs_secrets: str | None) -> str:
     return config.jobs_secrets
 
 
+def _resolve_artifact_repo(config: Config, cli_artifact_repo: str | None) -> str | None:
+    """Resolve the effective HF Jobs artifact repo from CLI override or config."""
+    return cli_artifact_repo or config.artifact_repo
+
+
 def _require_jobs_config(
     *,
     executor_name: ExecutorName,
@@ -309,7 +321,10 @@ def _require_jobs_config(
     if executor_name != "jobs":
         return None
     if not artifact_repo:
-        raise click.ClickException("--artifact-repo is required when using --executor jobs.")
+        raise click.ClickException(
+            "--artifact-repo or `artifact_repo` in upskill.config.yaml is required "
+            "when using --executor jobs."
+        )
     return JobsConfig(
         artifact_repo=artifact_repo,
         wait=wait,
@@ -361,6 +376,11 @@ def _print_model_plan(command: str, resolved: ResolvedModels, runs: int | None =
             else ("on" if resolved.run_baseline else "off")
         )
         console.print(f"  Baseline: {baseline_state}")
+        if resolved.is_benchmark_mode:
+            console.print(
+                "  Comparison: with-skill only across models/runs; "
+                "run one model with --runs 1 to measure baseline lift"
+            )
         console.print(f"  Test Generation Model: {resolved.test_generation_model}")
 
 
@@ -1176,6 +1196,7 @@ async def _generate_async(
     config = Config.load()
     executor_name = _resolve_executor_name(config, executor_name)
     max_parallel = _resolve_max_parallel(config, max_parallel)
+    artifact_repo = _resolve_artifact_repo(config, artifact_repo)
     jobs_secrets = _resolve_jobs_secrets(config, jobs_secrets)
     jobs_config = _require_jobs_config(
         executor_name=executor_name,
@@ -1263,6 +1284,7 @@ async def _generate_async(
             executor = _build_executor(
                 executor_name,
                 jobs_config=jobs_config,
+                artifact_repo=artifact_repo,
                 progress_callback=_print_eval_progress,
             )
 
@@ -1539,6 +1561,7 @@ async def _eval_async(  # noqa: C901
     executor_name = _resolve_executor_name(config, executor_name)
     num_runs = _resolve_num_runs(config, num_runs, command="eval")
     max_parallel = _resolve_max_parallel(config, max_parallel)
+    artifact_repo = _resolve_artifact_repo(config, artifact_repo)
     jobs_secrets = _resolve_jobs_secrets(config, jobs_secrets)
     jobs_config = _require_jobs_config(
         executor_name=executor_name,
@@ -1555,6 +1578,7 @@ async def _eval_async(  # noqa: C901
         executor = _build_executor(
             executor_name,
             jobs_config=jobs_config,
+            artifact_repo=artifact_repo,
             progress_callback=_print_eval_progress,
         )
     resolved = resolve_models(
@@ -2018,6 +2042,7 @@ async def _benchmark_async(
     executor_name = _resolve_executor_name(config, executor_name)
     num_runs = _resolve_num_runs(config, num_runs, command="benchmark")
     max_parallel = _resolve_max_parallel(config, max_parallel)
+    artifact_repo = _resolve_artifact_repo(config, artifact_repo)
     jobs_secrets = _resolve_jobs_secrets(config, jobs_secrets)
     jobs_config = _require_jobs_config(
         executor_name=executor_name,
@@ -2037,6 +2062,7 @@ async def _benchmark_async(
     executor = _build_executor(
         executor_name,
         jobs_config=jobs_config,
+        artifact_repo=artifact_repo,
         progress_callback=_print_eval_progress,
     )
     resolved = resolve_models(
