@@ -1827,7 +1827,7 @@ def list_cmd(skills_dir: str | None, verbose: bool):
 
     for skill_dir in sorted(skills):
         skill_md = skill_dir / "SKILL.md"
-        content = skill_md.read_text()
+        content = skill_md.read_text(encoding="utf-8")
         lines = content.split("\n")
         name = skill_dir.name
 
@@ -1847,7 +1847,7 @@ def list_cmd(skills_dir: str | None, verbose: bool):
                 refs_branch = skill_branch.add("references/")
                 for ref_file in sorted(refs_dir.iterdir()):
                     if ref_file.is_file():
-                        ref_tokens = int(len(ref_file.read_text().split()) * 1.3)
+                        ref_tokens = int(len(ref_file.read_text(encoding="utf-8").split()) * 1.3)
                         total_tokens += ref_tokens
                         refs_branch.add(f"{ref_file.name} [dim](~{ref_tokens} tokens)[/dim]")
 

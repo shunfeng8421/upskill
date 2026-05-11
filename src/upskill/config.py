@@ -168,7 +168,7 @@ class Config(BaseModel):
             return cls()
 
         if config_path.exists():
-            with open(config_path) as f:
+            with open(config_path, encoding="utf-8") as f:
                 data = yaml.safe_load(f) or {}
             # Convert path strings to Path objects
             if "skills_dir" in data and isinstance(data["skills_dir"], str):
@@ -192,7 +192,7 @@ class Config(BaseModel):
         data["runs_dir"] = str(self.runs_dir)
         if self.fastagent_config:
             data["fastagent_config"] = str(self.fastagent_config)
-        with open(config_path, "w") as f:
+        with open(config_path, "w", encoding="utf-8") as f:
             yaml.dump(data, f, default_flow_style=False)
 
     @property

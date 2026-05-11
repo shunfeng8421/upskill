@@ -231,7 +231,7 @@ def _load_skill_state(path: Path) -> SkillState:
     if not meta_path.exists():
         return state
 
-    meta_dict = json.loads(meta_path.read_text())
+    meta_dict = json.loads(meta_path.read_text(encoding="utf-8"))
     if "metadata" in meta_dict:
         state.metadata = SkillMetadata.model_validate(meta_dict["metadata"])
     if "tests" in meta_dict:
@@ -246,7 +246,7 @@ def _load_artifact_directory(path: Path, directory_name: str) -> dict[str, str]:
         return {}
 
     return {
-        file_path.name: file_path.read_text()
+        file_path.name: file_path.read_text(encoding="utf-8")
         for file_path in directory.iterdir()
         if file_path.is_file()
     }
@@ -328,7 +328,7 @@ class Skill(BaseModel):
         if not skill_md_path.exists():
             raise FileNotFoundError(f"SKILL.md not found in {path}")
 
-        content = skill_md_path.read_text()
+        content = skill_md_path.read_text(encoding="utf-8")
         (
             name,
             description,
